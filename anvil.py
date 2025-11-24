@@ -108,8 +108,26 @@ class AutoBuilder:
         # 6. Rust (Cargo)
         elif (source_path / "Cargo.toml").exists():
             Colors.print("Detected Rust project", Colors.OKBLUE)
-            # Installs binary to {install_prefix}/bin
-            steps = [f"cargo install --path . --root {install_prefix}"]
+            
+            is_virtual_workspace = False
+            try:
+                with open(source_path / "Cargo.toml", 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if "[workspace]" in content and "[package]" not in content:
+                        is_virtual_workspace = True
+            except: pass
+
+            if is_virtual_workspace:
+                Colors.print("Detected Cargo Workspace. Building release target...", Colors.OKBLUE)
+                # Strategy: Build all, then manually copy executables from target/release
+                steps = [
+                    "cargo build --release",
+                    AutoBuilder._copy_cargo_bins
+                ]
+            else:
+                # Standard single package
+                steps = [f"cargo install --path . --root {install_prefix}"]
+            
             return steps, []
 
         else:
@@ -117,6 +135,38 @@ class AutoBuilder:
             # Fallback: Just copy everything
             steps = [f"cp -r ./* {install_prefix}/"]
             return steps, []
+
+    @staticmethod
+    def _copy_cargo_bins(build_path, install_path):
+        """Helper to find and copy compiled Rust binaries."""
+        release_dir = build_path / "target" / "release"
+        bin_dir = install_path / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        
+        if not release_dir.exists():
+            Colors.print(f"Build failed: {release_dir} does not exist", Colors.FAIL)
+            return
+
+        count = 0
+        for item in release_dir.iterdir():
+            if not item.is_file(): continue
+            
+            # Windows: Check for .exe
+            if os.name == 'nt':
+                if item.suffix == '.exe':
+                    Colors.print(f"Copying {item.name}...", Colors.OKBLUE)
+                    shutil.copy(item, bin_dir)
+                    count += 1
+            # Unix: Check for executable permission and no extension (usually)
+            else:
+                if os.access(item, os.X_OK) and '.' not in item.name:
+                    Colors.print(f"Copying {item.name}...", Colors.OKBLUE)
+                    shutil.copy(item, bin_dir)
+                    count += 1
+        
+        if count == 0:
+            Colors.print("Warning: No executables found in target/release", Colors.WARNING)
+
 
 # --- Index Management ---
 
@@ -239,8 +289,12 @@ class Anvil:
         install_path.mkdir(parents=True, exist_ok=True)
 
         for step in steps:
-            Colors.print(f"Running: {step}")
-            run_cmd(step, cwd=build_path)
+            # Step can be a string (shell command) or a callable (python function)
+            if callable(step):
+                step(build_path, install_path)
+            else:
+                Colors.print(f"Running: {step}")
+                run_cmd(step, cwd=build_path)
 
         # Link Binaries (Heuristic + Explicit)
         self._link_binaries(install_path, binaries)
