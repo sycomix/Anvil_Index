@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Configuration
-# REPLACE THIS URL with the actual raw URL of your anvil.py
-ANVIL_SOURCE_URL="https://raw.githubusercontent.com/sycomix/Anvil/main/anvil.py"
+# UPDATED: Pointing to Anvil_Index repo
+ANVIL_SOURCE_URL="https://raw.githubusercontent.com/sycomix/Anvil_Index/main/anvil.py"
 
 ANVIL_ROOT="$HOME/.anvil"
 CORE_DIR="$ANVIL_ROOT/core"

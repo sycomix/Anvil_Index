@@ -1,0 +1,10 @@
+# Anvil - The Source Package Manager
+# Python 3.12+ required
+#
+# This project uses only Python standard library modules.
+# No external dependencies are required.
+#
+# Standard library modules used:
+# - os, sys, json, shutil, subprocess
+# - argparse, platform, urllib
+# - tarfile, zipfile, sqlite3, pathlib

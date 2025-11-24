@@ -1,9 +1,8 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
 :: Configuration
-:: REPLACE THIS URL with the actual raw URL of your anvil.py
-set "ANVIL_SOURCE_URL=https://raw.githubusercontent.com/sycomix/Anvil/main/anvil.py"
+set "ANVIL_SOURCE_URL=https://raw.githubusercontent.com/sycomix/Anvil_Index/main/anvil.py"
 
 set "ANVIL_ROOT=%USERPROFILE%\.anvil"
 set "CORE_DIR=%ANVIL_ROOT%\core"
@@ -13,12 +12,7 @@ echo [ANVIL] Installing Anvil Package Manager...
 
 :: 1. Check for Python
 python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python is not installed or not in your PATH.
-    echo Please install Python from https://python.org or the Microsoft Store.
-    pause
-    exit /b 1
-)
+if !errorlevel! neq 0 goto :NoPython
 
 :: 2. Create Directories
 if not exist "%CORE_DIR%" mkdir "%CORE_DIR%"
@@ -26,13 +20,13 @@ if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
 :: 3. Download Anvil
 echo [ANVIL] Downloading core files...
-curl -L -o "%CORE_DIR%\anvil.py" "%ANVIL_SOURCE_URL%"
+curl -f -L -o "%CORE_DIR%\anvil.py" "%ANVIL_SOURCE_URL%"
 
-if not exist "%CORE_DIR%\anvil.py" (
-    echo [ERROR] Failed to download anvil.py. Check your internet connection or the URL.
-    pause
-    exit /b 1
-)
+if !errorlevel! neq 0 goto :DownloadError
+
+:: Double check file content for 404 text just in case curl didn't catch it
+findstr /C:"404: Not Found" "%CORE_DIR%\anvil.py" >nul
+if !errorlevel! equ 0 goto :ContentError
 
 :: 4. Create Batch Shim
 echo [ANVIL] Creating executable shim...
@@ -47,9 +41,7 @@ call "%BIN_DIR%\anvil.bat" update
 
 :: 6. Add to PATH
 echo [ANVIL] Adding to User PATH...
-:: This checks if the path is already there to avoid duplication could be complex in batch,
-:: so we stick to a simple setx. 
-:: WARNING: setx truncates PATH if it's > 1024 chars, but it's the standard way in batch.
+:: setx can sometimes truncate long paths, but it is the standard way to set persistent vars
 setx PATH "%BIN_DIR%;%PATH%" >nul
 
 echo.
@@ -58,4 +50,25 @@ echo.
 echo You may need to restart your command prompt or terminal for the PATH changes to take effect.
 echo Try running: anvil --help
 echo.
+goto :End
+
+:: --- Error Handlers ---
+
+:NoPython
+echo [ERROR] Python is not installed or not in your PATH.
+echo Please install Python from https://python.org or the Microsoft Store.
+goto :End
+
+:DownloadError
+echo [ERROR] Failed to download anvil.py (HTTP Error).
+echo Please check that the URL exists: %ANVIL_SOURCE_URL%
+goto :End
+
+:ContentError
+echo [ERROR] Downloaded file contains '404: Not Found'.
+echo The URL is incorrect or the file does not exist on GitHub yet.
+if exist "%CORE_DIR%\anvil.py" del "%CORE_DIR%\anvil.py"
+goto :End
+
+:End
 pause
