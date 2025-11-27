@@ -63,7 +63,6 @@ class AutoBuilder:
     def detect(source_path, install_prefix):
         steps = []
         binaries = []
-        
         # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
         if (source_path / "anvil.json").exists():
             with open(source_path / "anvil.json") as f:
@@ -155,148 +154,42 @@ class AutoBuilder:
             steps = [f"cp -r ./* {install_prefix}/"]
             return steps, []
 
-        # 2. Python (setup.py)
-        if (source_path / "setup.py").exists():
-            Colors.print("Detected Python project (setup.py)", Colors.OKBLUE)
-            steps = [
-        # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
-        if (source_path / "anvil.json").exists():
-            with open(source_path / "anvil.json") as f:
-                data = json.load(f)
-                build_deps = data.get("build_dependencies", [])
-                if build_deps:
-                    AutoBuilder.install_build_dependencies(build_deps)
-                return data.get("build", {}).get("common", []), data.get("binaries", [])
-        # 3. Python (requirements.txt only)
-        elif (source_path / "requirements.txt").exists():
-            Colors.print("Detected Python requirements", Colors.OKBLUE)
-            steps = [f"{sys.executable} -m pip install -r requirements.txt --target {install_prefix}"]
-            return steps, []
 
-        # 4. Make
-        elif (source_path / "Makefile").exists():
-        elif (source_path / "requirements.txt").exists():
-            steps = [
-                "make",
-                f"make install PREFIX={install_prefix}"
-            ]
-            return steps, []
-
-        # 5. CMake
-        elif (source_path / "CMakeLists.txt").exists():
-            Colors.print("Detected CMake project", Colors.OKBLUE)
-            steps = [
-                "mkdir -p build",
-                f"cd build && cmake .. -DCMAKE_INSTALL_PREFIX={install_prefix}",
-                "cd build && make",
-                "cd build && make install"
-            ]
-            return steps, []
-
-        # 6. Rust (Cargo)
-        elif (source_path / "Cargo.toml").exists():
-            Colors.print("Detected Rust project", Colors.OKBLUE)
-            
-            is_virtual_workspace = False
-            try:
-                # 7. Go (go.mod)
-                elif (source_path / "go.mod").exists():
-                    Colors.print("Detected Go project (go.mod)", Colors.OKBLUE)
-                    steps = [
-                        f"go build -o {install_prefix / 'bin' / source_path.name}",
-                    ]
-                    return steps, [source_path.name]
-                # 8. Node.js (package.json)
-                elif (source_path / "package.json").exists():
-                    Colors.print("Detected Node.js project (package.json)", Colors.OKBLUE)
-                    steps = [
-                        "npm install",
-                        "npm run build || true"
-                    ]
-                    return steps, []
-                # 9. Java (pom.xml)
-                elif (source_path / "pom.xml").exists():
-                    Colors.print("Detected Java project (pom.xml)", Colors.OKBLUE)
-                    steps = [
-                        "mvn package",
-                        f"cp target/*.jar {install_prefix}/"
-                    ]
-                    return steps, []
-                # 10. Archives (.tar.xz, .7z, etc.)
-                for ext in [".tar.xz", ".7z", ".tar.bz2"]:
-                    for file in source_path.glob(f"*{ext}"):
-                        Colors.print(f"Detected archive: {file.name}", Colors.OKBLUE)
-                        steps = [f"tar -xf {file} -C {install_prefix}"]
-                        return steps, []
-                # 11. Mercurial (hg)
-                if (source_path / ".hg").exists():
-                    Colors.print("Detected Mercurial repository", Colors.OKBLUE)
-                    steps = ["hg pull", "hg update"]
-                    return steps, []
-                # 12. SVN
-                if (source_path / ".svn").exists():
-                    Colors.print("Detected SVN repository", Colors.OKBLUE)
-                    steps = ["svn update"]
-                    return steps, []
-                with open(source_path / "Cargo.toml", 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    if "[workspace]" in content and "[package]" not in content:
-                        is_virtual_workspace = True
-
-            @staticmethod
-            def install_build_dependencies(deps):
-                """
-                Install build dependencies using system package manager.
-                """
-                if not deps:
-                    return
-                Colors.print(f"Installing build dependencies: {', '.join(deps)}", Colors.OKBLUE)
-                if platform.system() == "Linux":
-                    run_cmd(f"sudo apt-get update && sudo apt-get install -y {' '.join(deps)}")
-                elif platform.system() == "Darwin":
-                    run_cmd(f"brew install {' '.join(deps)}")
-                elif platform.system() == "Windows":
-                    run_cmd(f"choco install {' '.join(deps)}")
-                else:
-                    Colors.print("Unknown platform for dependency installation.", Colors.WARNING)
-                def housekeeping(self):
-                    """
-                    Cleans up build directories, orphaned binaries, and unused dependencies.
-                    """
-                    Colors.print("Running housekeeping...", Colors.HEADER)
-                    # Remove build directory
-                    if BUILD_DIR.exists():
-                        shutil.rmtree(BUILD_DIR)
-                        Colors.print("Build directory cleaned.", Colors.OKGREEN)
-                    # Remove orphaned binaries (not in installed packages)
-                    installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
-                    for bin_file in BIN_DIR.iterdir():
-                        if bin_file.is_file():
-                            name = bin_file.stem
-                            if name not in installed:
-                                bin_file.unlink()
-                                Colors.print(f"Removed orphaned binary: {bin_file.name}", Colors.OKBLUE)
-                    Colors.print("Housekeeping complete.", Colors.OKGREEN)
-            except: pass
-
-            if is_virtual_workspace:
-                Colors.print("Detected Cargo Workspace. Building release target...", Colors.OKBLUE)
-                # Strategy: Build all, then manually copy executables from target/release
-                steps = [
-                    "cargo build --release",
-                    AutoBuilder._copy_cargo_bins
-                ]
-            else:
-                # Standard single package
-                steps = [f"cargo install --path . --root {install_prefix}"]
-            
-            return steps, []
-
+    @staticmethod
+    def install_build_dependencies(deps):
+        """
+        Install build dependencies using system package manager.
+        """
+        if not deps:
+            return
+        Colors.print(f"Installing build dependencies: {', '.join(deps)}", Colors.OKBLUE)
+        if platform.system() == "Linux":
+            run_cmd(f"sudo apt-get update && sudo apt-get install -y {' '.join(deps)}")
+        elif platform.system() == "Darwin":
+            run_cmd(f"brew install {' '.join(deps)}")
+        elif platform.system() == "Windows":
+            run_cmd(f"choco install {' '.join(deps)}")
         else:
-            Colors.print("No build system detected. Copying files as-is.", Colors.WARNING)
-            # Fallback: Just copy everything
-            steps = [f"cp -r ./* {install_prefix}/"]
-            return steps, []
+            Colors.print("Unknown platform for dependency installation.", Colors.WARNING)
+
+    def housekeeping(self):
+        """
+        Cleans up build directories, orphaned binaries, and unused dependencies.
+        """
+        Colors.print("Running housekeeping...", Colors.HEADER)
+        # Remove build directory
+        if BUILD_DIR.exists():
+            shutil.rmtree(BUILD_DIR)
+            Colors.print("Build directory cleaned.", Colors.OKGREEN)
+        # Remove orphaned binaries (not in installed packages)
+        installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
+        for bin_file in BIN_DIR.iterdir():
+            if bin_file.is_file():
+                name = bin_file.stem
+                if name not in installed:
+                    bin_file.unlink()
+                    Colors.print(f"Removed orphaned binary: {bin_file.name}", Colors.OKBLUE)
+        Colors.print("Housekeeping complete.", Colors.OKGREEN)
 
     @staticmethod
     def _copy_cargo_bins(build_path, install_path):
