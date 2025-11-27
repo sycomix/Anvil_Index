@@ -68,17 +68,105 @@ class AutoBuilder:
         if (source_path / "anvil.json").exists():
             with open(source_path / "anvil.json") as f:
                 data = json.load(f)
+                build_deps = data.get("build_dependencies", [])
+                if build_deps:
+                    AutoBuilder.install_build_dependencies(build_deps)
                 return data.get("build", {}).get("common", []), data.get("binaries", [])
+        elif (source_path / "setup.py").exists():
+            Colors.print("Detected Python project (setup.py)", Colors.OKBLUE)
+            steps = [
+                f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
+            ]
+            return steps, []
+        elif (source_path / "requirements.txt").exists():
+            Colors.print("Detected Python requirements", Colors.OKBLUE)
+            steps = [f"{sys.executable} -m pip install -r requirements.txt --target {install_prefix}"]
+            return steps, []
+        elif (source_path / "Makefile").exists():
+            Colors.print("Detected Makefile", Colors.OKBLUE)
+            steps = [
+                "make",
+                f"make install PREFIX={install_prefix}"
+            ]
+            return steps, []
+        elif (source_path / "CMakeLists.txt").exists():
+            Colors.print("Detected CMake project", Colors.OKBLUE)
+            steps = [
+                "mkdir -p build",
+                f"cd build && cmake .. -DCMAKE_INSTALL_PREFIX={install_prefix}",
+                "cd build && make",
+                "cd build && make install"
+            ]
+            return steps, []
+        elif (source_path / "Cargo.toml").exists():
+            Colors.print("Detected Rust project", Colors.OKBLUE)
+            is_virtual_workspace = False
+            try:
+                with open(source_path / "Cargo.toml", 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if "[workspace]" in content and "[package]" not in content:
+                        is_virtual_workspace = True
+            except: pass
+            if is_virtual_workspace:
+                Colors.print("Detected Cargo Workspace. Building release target...", Colors.OKBLUE)
+                steps = [
+                    "cargo build --release",
+                    AutoBuilder._copy_cargo_bins
+                ]
+            else:
+                steps = [f"cargo install --path . --root {install_prefix}"]
+            return steps, []
+        elif (source_path / "go.mod").exists():
+            Colors.print("Detected Go project (go.mod)", Colors.OKBLUE)
+            steps = [
+                f"go build -o {install_prefix / 'bin' / source_path.name}",
+            ]
+            return steps, [source_path.name]
+        elif (source_path / "package.json").exists():
+            Colors.print("Detected Node.js project (package.json)", Colors.OKBLUE)
+            steps = [
+                "npm install",
+                "npm run build || true"
+            ]
+            return steps, []
+        elif (source_path / "pom.xml").exists():
+            Colors.print("Detected Java project (pom.xml)", Colors.OKBLUE)
+            steps = [
+                "mvn package",
+                f"cp target/*.jar {install_prefix}/"
+            ]
+            return steps, []
+        else:
+            # Archives (.tar.xz, .7z, etc.)
+            for ext in [".tar.xz", ".7z", ".tar.bz2"]:
+                for file in source_path.glob(f"*{ext}"):
+                    Colors.print(f"Detected archive: {file.name}", Colors.OKBLUE)
+                    steps = [f"tar -xf {file} -C {install_prefix}"]
+                    return steps, []
+            if (source_path / ".hg").exists():
+                Colors.print("Detected Mercurial repository", Colors.OKBLUE)
+                steps = ["hg pull", "hg update"]
+                return steps, []
+            if (source_path / ".svn").exists():
+                Colors.print("Detected SVN repository", Colors.OKBLUE)
+                steps = ["svn update"]
+                return steps, []
+            Colors.print("No build system detected. Copying files as-is.", Colors.WARNING)
+            steps = [f"cp -r ./* {install_prefix}/"]
+            return steps, []
 
         # 2. Python (setup.py)
         if (source_path / "setup.py").exists():
             Colors.print("Detected Python project (setup.py)", Colors.OKBLUE)
             steps = [
-                f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
-            ]
-            # Heuristic: bin usually ends up in 'bin' subdir of target, handled by link step
-            return steps, [] # Binaries handled dynamically later
-
+        # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
+        if (source_path / "anvil.json").exists():
+            with open(source_path / "anvil.json") as f:
+                data = json.load(f)
+                build_deps = data.get("build_dependencies", [])
+                if build_deps:
+                    AutoBuilder.install_build_dependencies(build_deps)
+                return data.get("build", {}).get("common", []), data.get("binaries", [])
         # 3. Python (requirements.txt only)
         elif (source_path / "requirements.txt").exists():
             Colors.print("Detected Python requirements", Colors.OKBLUE)
@@ -87,7 +175,7 @@ class AutoBuilder:
 
         # 4. Make
         elif (source_path / "Makefile").exists():
-            Colors.print("Detected Makefile", Colors.OKBLUE)
+        elif (source_path / "requirements.txt").exists():
             steps = [
                 "make",
                 f"make install PREFIX={install_prefix}"
