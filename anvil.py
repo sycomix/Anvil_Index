@@ -106,14 +106,24 @@ class AutoBuilder:
                     if "[workspace]" in content and "[package]" not in content:
                         is_virtual_workspace = True
             except: pass
+            # Workspace: build all, then copy any bins and libs
             if is_virtual_workspace:
                 Colors.print("Detected Cargo Workspace. Building release target...", Colors.OKBLUE)
                 steps = [
                     "cargo build --release",
-                    AutoBuilder._copy_cargo_bins
+                    AutoBuilder._copy_cargo_bins,
+                    AutoBuilder._copy_cargo_libs
                 ]
             else:
-                steps = [f"cargo install --path . --root {install_prefix}"]
+                # Single package: determine if it's a binary or library
+                if AutoBuilder._has_cargo_binary(source_path):
+                    steps = [f"cargo install --path . --root {install_prefix}"]
+                else:
+                    Colors.print("Detected Rust library crate. Building release and copying library artifacts...", Colors.OKBLUE)
+                    steps = [
+                        "cargo build --release",
+                        AutoBuilder._copy_cargo_libs
+                    ]
             return steps, []
         elif (source_path / "go.mod").exists():
             Colors.print("Detected Go project (go.mod)", Colors.OKBLUE)
@@ -221,6 +231,54 @@ class AutoBuilder:
         
         if count == 0:
             Colors.print("Warning: No executables found in target/release", Colors.WARNING)
+
+    @staticmethod
+    def _copy_cargo_libs(build_path, install_path):
+        """Helper to find and copy compiled Rust library artifacts.
+        Copies .rlib, static and shared library artifacts into <install_prefix>/lib.
+        """
+        release_dir = build_path / "target" / "release"
+        lib_dir = install_path / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+
+        if not release_dir.exists():
+            Colors.print(f"Build failed: {release_dir} does not exist", Colors.FAIL)
+            return
+
+        patterns = ["*.rlib", "*.a", "*.so", "*.dll", "*.dylib"]
+        count = 0
+        for pat in patterns:
+            for item in release_dir.glob(pat):
+                if item.is_file():
+                    Colors.print(f"Copying lib {item.name}...", Colors.OKBLUE)
+                    shutil.copy(item, lib_dir)
+                    count += 1
+
+        if count == 0:
+            Colors.print("Warning: No library artifacts found in target/release", Colors.WARNING)
+
+    @staticmethod
+    def _has_cargo_binary(source_path):
+        """Return True if this Cargo package has any binary targets (bins or src/main.rs).
+        Uses heuristics: existence of src/main.rs, src/bin/*, or [[bin]] in Cargo.toml.
+        """
+        # 1. main.rs
+        if (source_path / "src" / "main.rs").exists():
+            return True
+        # 2. src/bin directory exists and has files
+        bin_dir = source_path / "src" / "bin"
+        if bin_dir.exists() and any(bin_dir.iterdir()):
+            return True
+        # 3. explicit [[bin]] entries in Cargo.toml
+        try:
+            toml_path = source_path / "Cargo.toml"
+            if toml_path.exists():
+                content = toml_path.read_text(encoding='utf-8')
+                if "[[bin]]" in content:
+                    return True
+        except Exception:
+            pass
+        return False
 
 
 # --- Index Management ---
