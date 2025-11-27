@@ -13,6 +13,7 @@ import zipfile
 import sqlite3
 from pathlib import Path
 import stat
+import time
 
 # --- Configuration & Constants ---
 HOME = Path.home()
@@ -71,16 +72,24 @@ def _on_rm_error(func, path, exc_info):
         raise
 
 
-def safe_rmtree(path):
+def safe_rmtree(path, retries: int = 3, delay: float = 0.5):
     """Remove directory tree safely, dealing with Windows read-only attributes.
-    Falls back to a best-effort recursive unlink with chmod on errors.
+    Retries removal a few times with small delays in case files are transiently locked.
     """
     if not path.exists():
         return
-    try:
-        shutil.rmtree(path, onerror=_on_rm_error)
-    except Exception as e:
-        Colors.print(f"Could not remove path {path}: {e}", Colors.WARNING)
+    attempt = 0
+    last_err = None
+    while attempt < retries:
+        try:
+            shutil.rmtree(path, onerror=_on_rm_error)
+            return
+        except Exception as e:
+            last_err = e
+            Colors.print(f"Retrying removal of {path}: {e}", Colors.WARNING)
+            time.sleep(delay)
+            attempt += 1
+    Colors.print(f"Could not remove path {path} after {retries} attempts: {last_err}", Colors.FAIL)
 
 # --- Auto-Discovery Build Engine ---
 
@@ -443,7 +452,7 @@ class Anvil:
         self._link_binaries(install_path, binaries)
 
         # Cleanup
-        shutil.rmtree(build_path)
+        safe_rmtree(build_path)
         Colors.print(f"Successfully forged {name}!", Colors.OKGREEN)
 
     def _link_binaries(self, install_path, explicit_binaries):
