@@ -12,6 +12,7 @@ import tarfile
 import zipfile
 import sqlite3
 from pathlib import Path
+import stat
 
 # --- Configuration & Constants ---
 HOME = Path.home()
@@ -51,6 +52,35 @@ def run_cmd(command, cwd=None, shell=True, verbose=True):
         Colors.print(f"Command failed: {command}", Colors.FAIL)
         if "git" in command: raise
         sys.exit(1)
+
+
+def _on_rm_error(func, path, exc_info):
+    """Error handler for shutil.rmtree to handle read-only files on Windows.
+    Tries to make file writable and retries the operation.
+    """
+    import errno
+    # Only handle permission errors
+    if not os.access(path, os.W_OK):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            Colors.print(f"Failed to remove {path}: {exc_info}", Colors.FAIL)
+    else:
+        # Raise if it's a different error
+        raise
+
+
+def safe_rmtree(path):
+    """Remove directory tree safely, dealing with Windows read-only attributes.
+    Falls back to a best-effort recursive unlink with chmod on errors.
+    """
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, onerror=_on_rm_error)
+    except Exception as e:
+        Colors.print(f"Could not remove path {path}: {e}", Colors.WARNING)
 
 # --- Auto-Discovery Build Engine ---
 
@@ -189,7 +219,7 @@ class AutoBuilder:
         Colors.print("Running housekeeping...", Colors.HEADER)
         # Remove build directory
         if BUILD_DIR.exists():
-            shutil.rmtree(BUILD_DIR)
+            safe_rmtree(BUILD_DIR)
             Colors.print("Build directory cleaned.", Colors.OKGREEN)
         # Remove orphaned binaries (not in installed packages)
         installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
@@ -381,7 +411,7 @@ class Anvil:
         build_path = BUILD_DIR / name
         install_path = INSTALL_DIR / name
 
-        if build_path.exists(): shutil.rmtree(build_path)
+        if build_path.exists(): safe_rmtree(build_path)
         build_path.mkdir()
 
         # Fetch Source
@@ -398,7 +428,7 @@ class Anvil:
         
         # Build
         Colors.print("Forging (Building)...", Colors.OKBLUE)
-        if install_path.exists(): shutil.rmtree(install_path)
+        if install_path.exists(): safe_rmtree(install_path)
         install_path.mkdir(parents=True, exist_ok=True)
 
         for step in steps:
