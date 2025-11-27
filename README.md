@@ -42,3 +42,7 @@ Open the Pull Request:Anvil will generate a URL in your terminal. Open it in you
 ## Rust Libraries
 
 If a repository is a Rust library (non-binary crate), Anvil will run `cargo build --release` and copy the built library artifacts into `~/.anvil/opt/<package>/lib` (e.g., `.rlib`, `.so`, `.dylib`, `.dll`, or `.a`). Binaries are not installed via `cargo install` for library-only crates.
+
+## Housekeeping
+
+Use the `anvil housekeeping` command to remove temporary build directories and clean up orphaned binaries in `~/.anvil/bin` that do not correspond to installed packages. This is useful after failed builds or when iterating on formulas locally.

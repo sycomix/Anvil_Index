@@ -479,7 +479,16 @@ class Anvil:
             if src.name.startswith("."): continue # skip hidden
             
             dest = BIN_DIR / src.name
-            if dest.exists(): dest.unlink()
+            if dest.exists(): 
+                try:
+                    dest.unlink()
+                except PermissionError:
+                    # Try make writable then unlink
+                    try:
+                        os.chmod(dest, stat.S_IWRITE)
+                        dest.unlink()
+                    except Exception as e:
+                        Colors.print(f"Could not remove old link {dest}: {e}", Colors.WARNING)
 
             Colors.print(f"Linking {src.name}...", Colors.OKBLUE)
             if os.name == 'nt':
