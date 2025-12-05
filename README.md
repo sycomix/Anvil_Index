@@ -114,6 +114,8 @@ Developer Notes
 - AutoBuilder: heuristics in `AutoBuilder.detect` prefer `anvil.json` then try common project files. When adding new build types, add a minimal detection block and include a `submissions/` example for testing.
  - Examples: `submissions/hello-make/` is a sample Makefile-based project that shows how to write an `anvil.json` and a simple Makefile using `DESTDIR` to install into Anvil's `opt` folder, and can be used for local validation.
  - Auto-submission: When an install is performed from a Git repository (via a URL or a local Git repo with a remote origin), Anvil will automatically add the repo to the local index and print a PR link so you can submit it to the central index for approval. This only happens if the remote URL is not already in the index.
+	- Note: By default, Anvil will auto-submit any installed repository not already present in the index. You may opt out by setting the `ANVIL_AUTO_SUBMIT` environment variable to `0` or `false` (e.g., `export ANVIL_AUTO_SUBMIT=0` on Unix shells or `setx ANVIL_AUTO_SUBMIT 0` on Windows). See also URL normalization below.
+	- URL normalization: Anvil normalizes repository URLs for comparison (converting `git@host:user/repo.git` to `https://host/user/repo`, stripping `.git`, and normalizing host case) to avoid duplicates across different URL formats. This means `git@github.com:user/repo.git` and `https://github.com/user/repo` are treated as the same repository for indexing purposes.
 - Tests: N/A — use `python anvil.py forge` against example projects for manual verification.
 
 Contributing

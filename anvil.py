@@ -148,12 +148,35 @@ class AutoBuilder:
 
             # Quote install path
             install_prefix_str = str(install_prefix)
-            # On many projects, 'make install' responds to PREFIX= or DESTDIR=
-            steps = [
-                f"{make_bin}",
-                f"{make_bin} install PREFIX=\"{install_prefix_str}\"",
-                f"{make_bin} install DESTDIR=\"{install_prefix_str}\""
-            ]
+            # On many projects, 'make install' responds to PREFIX= or DESTDIR=.
+            # We prefer to only run 'make install' when an 'install' target exists; otherwise,
+            # we run 'make' and copy any produced build artifacts to the install directory.
+            install_target = False
+            for name in ("Makefile", "GNUmakefile", "makefile"):
+                mf = source_path / name
+                if mf.exists():
+                    try:
+                        content = mf.read_text(encoding='utf-8')
+                        if "\ninstall:" in content or content.startswith("install:"):
+                            install_target = True
+                            break
+                    except (OSError, UnicodeDecodeError):
+                        # If we cannot read the file, assume no install target
+                        install_target = False
+            steps = [f"{make_bin}"]
+            if install_target:
+                steps.extend([
+                    f"{make_bin} install PREFIX=\"{install_prefix_str}\"",
+                    f"{make_bin} install DESTDIR=\"{install_prefix_str}\"",
+                ])
+            else:
+                # We'll rely on a generic copy step to collect built binaries
+                # If this is a go module, prefer running `go build` to produce a binary
+                if (source_path / 'go.mod').exists():
+                    bin_name = source_path.name
+                    steps.append(f"go build -o \"{install_prefix / 'bin' / bin_name}\" ./...")
+                    return steps, [bin_name]
+                steps.append(AutoBuilder._copy_build_bins)
             return steps, []
         elif (source_path / "CMakeLists.txt").exists():
             Colors.print("Detected CMake project", Colors.OKBLUE)
@@ -202,7 +225,7 @@ class AutoBuilder:
             if (source_path / 'main.go').exists() or ((source_path / 'cmd').exists() and any((source_path / 'cmd').rglob('*.go'))):
                 binary_name = source_path.name
                 steps = [
-                    f"go build -o {install_prefix / 'bin' / binary_name}",
+                    f"go build -o \"{install_prefix / 'bin' / binary_name}\"",
                 ]
                 return steps, [binary_name]
             else:
@@ -319,7 +342,7 @@ class AutoBuilder:
         release_dir = build_path / "target" / "release"
         bin_dir = install_path / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        
+
         if not release_dir.exists():
             Colors.print(f"Build failed: {release_dir} does not exist", Colors.FAIL)
             return
@@ -341,9 +364,52 @@ class AutoBuilder:
                     Colors.print(f"Copying {item.name}...", Colors.OKBLUE)
                     shutil.copy(item, bin_dir)
                     count += 1
-        
+
         if count == 0:
             Colors.print("Warning: No executables found in target/release", Colors.WARNING)
+
+    @staticmethod
+    def _copy_build_bins(build_path, install_path):
+
+        """Generic helper to find and copy executables produced by a build.
+
+        Searches common locations (bin, build, dist, top-level) for executables
+        and copies them into install_path/bin.
+        """
+        bin_dir = install_path / 'bin'
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        locations = [build_path, build_path / 'bin', build_path / 'build', build_path / 'dist', build_path / 'target' / 'release', build_path / 'cmd']
+        found = 0
+        probable_names = {build_path.name, install_path.name}
+        probable_names.add(f"{build_path.name}.exe")
+        probable_names.add(f"{install_path.name}.exe")
+
+        for loc in locations:
+            if not loc.exists():
+                continue
+            for item in loc.rglob('*'):
+                if not item.is_file():
+                    continue
+                # Windows: check for .exe, else check unix executable bit and skip typical extensions
+                try:
+                    if os.name == 'nt':
+                        if item.suffix.lower() == '.exe' or item.name in probable_names:
+                            Colors.print(f"Copying build artifact {item.name}...", Colors.OKBLUE)
+                            shutil.copy(item, bin_dir)
+                            found += 1
+                    else:
+                        if os.access(item, os.X_OK) or item.name in probable_names:
+                            # Avoid copying common archive files or scripts with extensions
+                            if item.suffix in ['.py', '.sh', '.txt', '.md', '.c', '.h', '.o', '.a', '.so', '.dll', '.dylib']:
+                                continue
+                            Colors.print(f"Copying build artifact {item.name}...", Colors.OKBLUE)
+                            shutil.copy(item, bin_dir)
+                            found += 1
+                except OSError:
+                    # ignore copy errors for individual files
+                    pass
+        if found == 0:
+            Colors.print("Warning: No build artifacts found to copy", Colors.WARNING)
 
     @staticmethod
     def _copy_cargo_libs(build_path, install_path):
@@ -412,19 +478,57 @@ class RepoIndex:
             except (subprocess.CalledProcessError, OSError):
                 # Ignore clone errors (no network or git missing)
                 pass
-        
+
         if not self.db_path.exists():
             self._create_bootstrap_db()
+        else:
+            # If the DB already exists, ensure schema is migrated if necessary.
+            try:
+                self._migrate_schema()
+            except sqlite3.Error:
+                # If migration fails, ignore and continue; DB is likely in usable state.
+                pass
 
     def _create_bootstrap_db(self):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS repositories
-                     (name text PRIMARY KEY, url text, description text)''')
+                     (name text PRIMARY KEY, url text, normalized_url text, description text)''')
         # Simple bootstrap
-        c.execute("INSERT OR IGNORE INTO repositories VALUES ('anvil-core', 'https://github.com/sycomix/anvil-core.git', 'Anvil Core')")
+        normalized_init = RepoIndex.normalize_url('https://github.com/sycomix/anvil-core.git')
+        c.execute("INSERT OR IGNORE INTO repositories (name, url, normalized_url, description) VALUES ('anvil-core', 'https://github.com/sycomix/anvil-core.git', ?, 'Anvil Core')", (normalized_init,))
+        c.execute("CREATE INDEX IF NOT EXISTS idx_repositories_normalized_url ON repositories(normalized_url)")
         conn.commit()
         conn.close()
+
+    def _migrate_schema(self):
+        """Add normalized_url column if missing and populate existing records."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        try:
+            c.execute("PRAGMA table_info(repositories)")
+            cols = [row[1] for row in c.fetchall()]
+            if 'normalized_url' not in cols:
+                c.execute("ALTER TABLE repositories ADD COLUMN normalized_url text")
+                # Populate normalized_url for existing rows
+                c.execute("SELECT name, url FROM repositories")
+                rows = c.fetchall()
+                for name, url in rows:
+                    normalized = RepoIndex.normalize_url(url) if url else None
+                    c.execute("UPDATE repositories SET normalized_url=? WHERE name=?", (normalized, name))
+                conn.commit()
+                # Create an index on normalized_url for fast lookups
+                c.execute("CREATE INDEX IF NOT EXISTS idx_repositories_normalized_url ON repositories(normalized_url)")
+                conn.commit()
+        finally:
+            conn.close()
+
+    def ensure_db(self):
+        """Public helper to ensure the DB and schema exist.
+
+        Tests and external callers can use this to make the index DB ready for use.
+        """
+        self._ensure_exists()
 
     def get_url(self, name):
         with sqlite3.connect(self.db_path) as conn:
@@ -435,16 +539,71 @@ class RepoIndex:
 
     def has_url(self, url):
         """Return True if the given URL is already present in the index DB."""
+        if not url:
+            return False
+        normalized = RepoIndex.normalize_url(url)
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("SELECT 1 FROM repositories WHERE url=?", (url,))
-            return bool(c.fetchone())
+            c.execute("SELECT normalized_url, url FROM repositories")
+            rows = c.fetchall()
+            for (row_norm, row_url) in rows:
+                if row_norm and row_norm == normalized:
+                    return True
+                if row_url and RepoIndex.normalize_url(row_url) == normalized:
+                    return True
+            return False
 
     def add_local(self, name, url):
+        # Normalize url before adding to avoid duplicates across formats
+        if not url:
+            raise ValueError("URL cannot be empty when adding to index")
+        normalized = RepoIndex.normalize_url(url)
+        if self.has_url(normalized):
+            return
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO repositories VALUES (?, ?, ?)", (name, url, "User added"))
+            c.execute("INSERT OR REPLACE INTO repositories (name, url, normalized_url, description) VALUES (?, ?, ?, ?)", (name, url, normalized, "User added"))
             conn.commit()
+
+    @staticmethod
+    def normalize_url(url: str) -> str:
+        """Return a canonical normalized URL for easier comparison.
+
+        Normalizes forms like git@host:user/repo.git -> https://host/user/repo, strips
+        trailing .git and trailing slashes, and lower-cases the host component.
+        """
+        if not url:
+            return url
+        url = url.strip()
+        # ssh style: git@host:user/repo.git
+        if url.startswith('git@'):
+            # Split into host and path
+            try:
+                user_host, path = url.split(':', 1)
+                host = user_host.split('@', 1)[1]
+                url = f"https://{host}/{path}"
+            except (ValueError, IndexError):
+                # Fallback to original
+                pass
+        # Replace ssh://git@host/ -> https://host/
+        if url.startswith('ssh://'):
+            parsed = urllib.parse.urlparse(url)
+            host = parsed.hostname or parsed.netloc
+            path = parsed.path
+            url = f"https://{host}{path}"
+        # For http/https parse and reconstruct canonical form
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme in ('http', 'https') and parsed.netloc:
+            host = parsed.netloc.lower()
+            path = parsed.path.rstrip('/')
+            # strip .git suffix
+            if path.endswith('.git'):
+                path = path[:-4]
+            url = f"https://{host}{path}"
+        # Ensure no trailing slash
+        if url.endswith('/'):
+            url = url[:-1]
+        return url.lower()
 
     def update(self):
         if (INDEX_DIR / ".git").exists():
@@ -463,6 +622,9 @@ class Anvil:
         self._setup_dirs()
         self._ensure_path()
         self.index = RepoIndex()
+        # Auto-submit repositories to the central index unless disabled via env var
+        val = os.environ.get('ANVIL_AUTO_SUBMIT', '1')
+        self.auto_submit = str(val).strip().lower() not in ('0', 'false', 'no')
 
     def _setup_dirs(self):
         for p in [ANVIL_ROOT, BUILD_DIR, INSTALL_DIR, BIN_DIR, INDEX_DIR]:
@@ -501,7 +663,7 @@ class Anvil:
         2. A git URL (e.g., 'https://github.com/foo/bar')
         3. A local path (e.g., './my-project')
         """
-        
+
         url = None
         name = None
         source_remote = None
@@ -566,7 +728,7 @@ class Anvil:
 
         # Auto-Detect Build System
         steps, binaries = AutoBuilder.detect(build_path, install_path)
-        
+
         # Build
         Colors.print("Forging (Building)...", Colors.OKBLUE)
         if install_path.exists():
@@ -580,7 +742,9 @@ class Anvil:
             else:
                 # Replace known placeholders (e.g., {PREFIX}) with real paths
                 if isinstance(step, str):
-                    rendered = step.replace("{PREFIX}", str(install_path))
+                    # Use forward slashes for paths in shell commands to avoid escaping issues
+                    prefix_safe = str(install_path).replace('\\', '/')
+                    rendered = step.replace("{PREFIX}", prefix_safe)
                 else:
                     rendered = step
                 Colors.print(f"Running: {rendered}")
@@ -600,7 +764,7 @@ class Anvil:
                 final_url = source_remote
             elif url and (url.startswith('http') or url.startswith('git@')):
                 final_url = url
-            if final_url and not self.index.has_url(final_url):
+            if self.auto_submit and final_url and not self.index.has_url(final_url):
                 Colors.print(f"Repository {final_url} not found in index — submitting a PR to add it.", Colors.HEADER)
                 self.submit(final_url)
         except (sqlite3.Error, subprocess.CalledProcessError, OSError, ValueError):
@@ -611,7 +775,7 @@ class Anvil:
         Links explicit binaries AND scans for obvious executables.
         """
         candidates = []
-        
+
         # 1. Look in common bin folders
         for bin_folder in [install_path / "bin", install_path]:
             if bin_folder.exists():
@@ -621,16 +785,18 @@ class Anvil:
                     elif f.suffix in ['.exe', '.bat', '.py', '.sh']: # Windows/Script check
                         candidates.append(f)
 
-        # 2. Add explicit ones
+        # 2. Add explicit ones: look for files whose stem (name without extension) matches explicit names
         for b in explicit_binaries:
-            candidates.extend(list(install_path.rglob(b)))
+            for f in install_path.rglob('*'):
+                if f.is_file() and f.stem == b:
+                    candidates.append(f)
 
         # 3. Link
         for src in set(candidates):  # set for unique
             if src.name.startswith("."):
                 # skip hidden
                 continue
-            
+
             dest = BIN_DIR / src.name
             if dest.exists():
                 try:
@@ -652,7 +818,7 @@ class Anvil:
     def submit(self, url):
         """Simple submission: Just URL and Name."""
         name = url.split("/")[-1].replace(".git", "")
-        
+
         # 1. Add Locally
         self.index.add_local(name, url)
         Colors.print(f"Added '{name}' to local index.", Colors.OKGREEN)
@@ -667,10 +833,11 @@ class Anvil:
             "message": f"Add {name}"
         }
         final_url = f"{base}?{urllib.parse.urlencode(params)}"
-        
+
         Colors.print("\n=== Submit to Global Index ===", Colors.HEADER)
         print(f"{final_url}\n")
         Colors.print("Click link to track this repo in the global index.", Colors.OKBLUE)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Anvil: Source Forge")
@@ -678,10 +845,10 @@ def main():
 
     # FORGE: The main tool. Accepts Name, URL, or Path.
     subparsers.add_parser("forge", help="Install from Index, URL, or Path").add_argument("target")
-    
+
     # SUBMIT: Add to index
     subparsers.add_parser("submit", help="Add URL to index").add_argument("url")
-    
+
     subparsers.add_parser("update", help="Update index")
     subparsers.add_parser("list", help="List installed")
 
