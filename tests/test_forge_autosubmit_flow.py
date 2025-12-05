@@ -30,21 +30,25 @@ class TestForgeAutoSubmitFlow(unittest.TestCase):
         self.repo_dir = self.tempdir / 'repo'
         self.repo_dir.mkdir()
         # Create minimal repo with anvil.json build step that creates a bin file
-        cmd = (
-            'python -c "import os; '
-            'os.makedirs(\'{PREFIX}/bin\', exist_ok=True); '
-            'open(\'{PREFIX}/bin/mybin\',\'w\').close()"'
+        cmd1 = (
+            'python -c "import os,sys; '
+            'os.makedirs(sys.argv[1] + \'/bin\', exist_ok=True)" {PREFIX}'
+        )
+        cmd2 = (
+            'python -c "import os,sys; '
+            'open(sys.argv[1] + \'/bin/mybin\', \'w\').close()" {PREFIX}'
         )
         anvil_json = {
             "name": "autosubmit-test",
             "binaries": ["mybin"],
             "build": {
                 "common": [
-                    cmd,
+                    cmd1,
+                    cmd2,
                 ]
             }
         }
-        import json
+        # Write the anvil.json describing two short build steps to be executed
         with open(self.repo_dir / 'anvil.json', 'w', encoding='utf-8') as f:
             json.dump(anvil_json, f)
         # init git repo and set remote

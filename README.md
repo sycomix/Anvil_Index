@@ -26,10 +26,19 @@ Note: You may need to restart your terminal or re-open your shell for PATH chang
 Usage
 -------
 Core commands:
-- Forge (install from Index, URL, or local path):
+-- Forge (install from Index, URL, or local path):
 ```bash
 python anvil.py forge ./path-to-repo
 python anvil.py forge https://github.com/user/repo.git
+```
+CLI options:
+- Override MSVC runtime for the forge command:
+```bash
+python anvil.py forge --msvc-runtime MD ./path-to-repo
+```
+- Force -fPIC on POSIX builds:
+```bash
+python anvil.py forge --force-pic ./path-to-repo
 ```
 - Submit a hammer (adds to local index and generates a PR link):
 ```bash
@@ -64,6 +73,11 @@ Makefiles & Platform Notes
 - The AutoBuilder detects common Makefile filenames (`Makefile`, `GNUmakefile`, `makefile`).
 - If `make` is present on PATH the builder runs `make` followed by `make install PREFIX="{PREFIX}"` and `make install DESTDIR="{PREFIX}"` as it increases compatibility.
 - On Windows, the detection will try `mingw32-make` and `nmake` if `make` is not found. Users should install appropriate build tools (MSYS2/MinGW or Visual Studio) if building native projects on Windows.
+ 	- Note: To avoid linker/runtime mismatches when a project builds transitive C/C++ components (e.g., Rust crates calling into C/C++ libraries), Anvil will default MSVC builds to use the dynamic CRT (/MD) by setting the build environment and passing the corresponding CMake flag, which reduces errors caused by mixing static and dynamic CRTs across multi-stage builds.
+  
+	- Optional environment knobs:
+		- `ANVIL_MSVC_RUNTIME`: Override CRT selection on Windows. Set to `MD` (default) for dynamic CRT or `MT` for static CRT to match specific projects.
+		- `ANVIL_FORCE_PIC`: On macOS/Linux, set to `1` to append `-fPIC` to `CFLAGS`/`CXXFLAGS` for PIC builds. This helps when building shared libraries that must be position-independent.
 - .NET: `*.csproj` -> `dotnet publish`
 - Zig: `build.zig`
 - Bazel: `WORKSPACE`/`BUILD` files

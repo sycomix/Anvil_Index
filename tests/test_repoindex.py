@@ -9,7 +9,7 @@ from anvil import RepoIndex
 class TestRepoIndexNormalization(unittest.TestCase):
     """Tests for URL normalization and index add/lookup behavior."""
     def setUp(self):
-        # Use a temporary db file so tests do not touch user's actual index
+        """Create a temporary DB file and configure RepoIndex for tests."""
         self.tmp_db = Path(tempfile.gettempdir()) / 'anvil_test_index.db'
         if self.tmp_db.exists():
             try:
@@ -22,6 +22,7 @@ class TestRepoIndexNormalization(unittest.TestCase):
         self.index.ensure_db()
 
     def tearDown(self):
+        """Cleanup temporary DB file used by tests."""
         if self.tmp_db.exists():
             try:
                 self.tmp_db.unlink()
@@ -29,16 +30,19 @@ class TestRepoIndexNormalization(unittest.TestCase):
                 pass
 
     def test_normalize_url_git_ssh(self):
+        """Normalize SSH URL to HTTPS canonical form."""
         url = 'git@github.com:projectdiscovery/katana.git'
         normalized = RepoIndex.normalize_url(url)
         self.assertEqual(normalized, 'https://github.com/projectdiscovery/katana')
 
     def test_normalize_url_http(self):
+        """Normalize HTTP(S) URL to canonical lowercase path without .git."""
         url = 'https://github.com/ProjectDiscovery/Katana.git'
         normalized = RepoIndex.normalize_url(url)
         self.assertEqual(normalized, 'https://github.com/projectdiscovery/katana')
 
     def test_add_local_and_has_url(self):
+        """Add a local repo and ensure has_url recognizes normalized forms."""
         url_ssh = 'git@github.com:projectdiscovery/katana.git'
         name = 'katana'
         self.index.add_local(name, url_ssh)

@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import re
 import shutil
 import subprocess
 import argparse
@@ -14,6 +15,12 @@ import sqlite3
 from pathlib import Path
 import stat
 import time
+import logging
+# Setup logger for Anvil; level can be overridden via ANVIL_LOG_LEVEL
+log_level = os.environ.get('ANVIL_LOG_LEVEL', 'INFO').upper()
+numeric_level = getattr(logging, log_level, logging.INFO)
+logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger('anvil')
 
 # --- Configuration & Constants ---
 HOME = Path.home()
@@ -38,40 +45,165 @@ class Colors:
 
     @staticmethod
     def print(msg, color=ENDC, prefix="[ANVIL]"):
+        # Use module-level logger for structured logs and Colors for terminal output
+        # Do not rebind to avoid shadowing the module-level 'logger'
+        # Default INFO level; warnings and errors mapped by color
+        if color == Colors.FAIL:
+            log_method = logger.error
+        elif color == Colors.WARNING:
+            log_method = logger.warning
+        else:
+            log_method = logger.info
+
+        try:
+            log_method("%s %s", prefix, msg)
+        except (ValueError, TypeError, OSError, UnicodeEncodeError):
+            # Ensure that logging errors (encoding, type, OS issues) don't prevent console output
+            pass
         if os.name == 'nt':
             print(f"{prefix} {msg}")
         else:
             print(f"{color}{prefix} {msg}{Colors.ENDC}")
 
 # --- Utilities ---
-def run_cmd(command, cwd=None, shell=True, verbose=True):
+def run_cmd(command, cwd=None, shell=True, verbose=True, env=None):
     """Run a shell command and return on success.
 
     If the command fails, prints an error and exits unless the command is
     a git command, in which case the original exception is re-raised.
     """
     try:
-        if verbose:
-            subprocess.check_call(command, cwd=cwd, shell=shell)
-        else:
-            subprocess.check_call(command, cwd=cwd, shell=shell, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        Colors.print(f"Command failed: {command}", Colors.FAIL)
-        if "git" in command:
+        # Use run to capture output for diagnostics (esp. linker errors)
+        cp = subprocess.run(command, cwd=cwd, shell=shell, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        if cp.returncode == 0:
+            if verbose:
+                # Print the command executed in verbose mode
+                Colors.print(f"Command succeeded: {command}")
+            return cp.stdout
+        # Failure: raise a specialized error with captured output
+        raise CommandExecutionError(command, cp.returncode, cp.stdout, cp.stderr)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as e:
+        # Generic fallback for known exception types (avoid catching BaseException/Exception)
+        Colors.print(f"Command failed: {command} ({e})", Colors.FAIL)
+        if "git" in str(command):
+            # Re-raise errors for git commands so callers can handle them
             raise
+        # Keep previous behavior: exit on failure for non-git commands
         sys.exit(1)
 
-def run_cmd_output(command, cwd=None, shell=True):
+def run_cmd_output(command, cwd=None, shell=True, env=None):
     """Run a command and return its stdout or None if the command fails.
 
     This function is a convenience wrapper around subprocess.check_output,
     returning None on failure so callers can detect absence of output.
     """
     try:
-        out = subprocess.check_output(command, cwd=cwd, shell=shell, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(command, cwd=cwd, shell=shell, stderr=subprocess.DEVNULL, env=env)
         return out.decode('utf-8').strip()
     except subprocess.CalledProcessError:
         return None
+
+
+class CommandExecutionError(Exception):
+    """Raised when a command executed via run_cmd fails.
+
+    Carries stdout/stderr to aid diagnostic analysis.
+    """
+    def __init__(self, command, returncode, stdout, stderr):
+        super().__init__(f"Command '{command}' failed with return code {returncode}")
+        self.command = command
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def detect_lnk_and_pic_issues(stderr: str) -> list:
+    """Scan output for LNK2038 (RuntimeLibrary mismatch) or PIC errors and return suggestions.
+
+    Returns a list of suggestion strings to apply in order to fix the issue.
+    """
+    suggestions = []
+    if not stderr:
+        return suggestions
+    text = stderr
+    # Detect MSVC Runtime mismatch LNK2038
+    if 'LNK2038' in text and 'RuntimeLibrary' in text:
+        # Extract the two settings if possible
+        # Example substring: "value 'MD_DynamicRelease' doesn't match value 'MT_StaticRelease'"
+        try:
+            m = re.search(r"value '([A-Z]+)_.*?' doesn't match value '([A-Z]+)_.*?'", text)
+            if m:
+                left = m.group(1)
+                right = m.group(2)
+                suggestions.append(f"Detected MSVC runtime mismatch between {left} and {right}. Consider building with a consistent C runtime.")
+        except (re.error, IndexError, TypeError):
+            suggestions.append("Detected MSVC runtime mismatch (LNK2038). Consider building with consistent /MD or /MT options.")
+        suggestions.append("Fix options to try:")
+        suggestions.append(" - Set environment variable ANVIL_MSVC_RUNTIME=MD (default dynamic CRT) or ANVIL_MSVC_RUNTIME=MT (static CRT)")
+        suggestions.append(" - For per-formula control, add 'msvc_runtime': 'MD' or 'MT' to anvil.json in the project")
+        suggestions.append(" - For CMake projects, add '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL' or 'MultiThreaded' depending on your choice")
+
+    # Detect PIC-related errors (relocation errors on Linux/macOS)
+    if 'recompile with -fPIC' in text or 'relocation' in text and 'R_X86_64' in text:
+        suggestions.append("Detected link-time relocation errors suggesting -fPIC is required for shared libraries.")
+        suggestions.append("Fix options to try:")
+        suggestions.append(" - Set environment variable ANVIL_FORCE_PIC=1 to add -fPIC to CFLAGS/CXXFLAGS when building.")
+        suggestions.append(" - Add 'force_pic': true to the project's anvil.json to force PIC for that formula")
+
+    return suggestions
+
+
+def default_build_env(msvc_runtime_override=None, force_pic_override=None):
+    """Return a default environment dictionary for build commands.
+
+    On Windows with MSVC we force the compiler runtime to use the dynamic CRT
+    (i.e. /MD / MultiThreadedDLL) to avoid linker mismatches across multi-stage
+    builds that include both rust/cargo cmake and C/C++ build steps.
+    """
+    env = os.environ.copy()
+    if os.name == 'nt':
+        # Ensure we request the dynamic CRT. Prefer /MD over /MT.
+        # Allow overriding via ANVIL_MSVC_RUNTIME: 'MD' (dll) or 'MT' (static)
+        requested = os.environ.get('ANVIL_MSVC_RUNTIME', '').strip().upper()
+        if msvc_runtime_override:
+            requested = str(msvc_runtime_override).strip().upper()
+        if requested == 'MT':
+            cl_flag = '/MT'
+            cmake_flag = 'MultiThreaded'
+        else:
+            # Default to dynamic CRT
+            cl_flag = '/MD'
+            cmake_flag = 'MultiThreadedDLL'
+
+        cl = env.get('CL', '')
+        # If CL contains either prefix, replace it with our chosen flag; otherwise prepend
+        if '/MT' in cl or '/MD' in cl:
+            env['CL'] = cl.replace('/MT', cl_flag).replace('/MD', cl_flag)
+        else:
+            env['CL'] = f"{cl_flag} {cl}".strip()
+
+        # Make CMake default to the matching MSVC runtime
+        env['CMAKE_MSVC_RUNTIME_LIBRARY'] = cmake_flag
+    # Handle POSIX-specific optional flags (Linux, macOS): allow user to
+    # force -fPIC for libraries with ANVIL_FORCE_PIC=1 to avoid reloc issues
+    # when creating shared libraries copied into install prefixes.
+    # When not requested, do not modify the user's CFLAGS/CXXFLAGS.
+    if os.name != 'nt':
+        # Respect explicit override; otherwise look at env var
+        force_pic = False
+        if force_pic_override is not None:
+            force_pic = bool(force_pic_override)
+        else:
+            force_pic = os.environ.get('ANVIL_FORCE_PIC', '').strip() in ('1', 'true', 'True', 'TRUE')
+        if force_pic:
+            cflags = env.get('CFLAGS', '')
+            if '-fPIC' not in cflags:
+                env['CFLAGS'] = (cflags + ' -fPIC').strip()
+            cxxflags = env.get('CXXFLAGS', '')
+            if '-fPIC' not in cxxflags:
+                env['CXXFLAGS'] = (cxxflags + ' -fPIC').strip()
+
+    return env
 
 
 def _on_rm_error(func, path, exc_info):
@@ -119,6 +251,7 @@ class AutoBuilder:
     @staticmethod
     def detect(source_path, install_prefix):
         steps = []
+        metadata = {}
         # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
         if (source_path / "anvil.json").exists():
             with open(source_path / "anvil.json", encoding='utf-8') as f:
@@ -126,17 +259,19 @@ class AutoBuilder:
                 build_deps = data.get("build_dependencies", [])
                 if build_deps:
                     AutoBuilder.install_build_dependencies(build_deps)
-                return data.get("build", {}).get("common", []), data.get("binaries", [])
+                metadata['msvc_runtime'] = data.get('msvc_runtime')
+                metadata['force_pic'] = data.get('force_pic')
+                return data.get("build", {}).get("common", []), data.get("binaries", []), metadata
         elif (source_path / "setup.py").exists():
             Colors.print("Detected Python project (setup.py)", Colors.OKBLUE)
             steps = [
                 f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "requirements.txt").exists():
             Colors.print("Detected Python requirements", Colors.OKBLUE)
             steps = [f"{sys.executable} -m pip install -r requirements.txt --target {install_prefix}"]
-            return steps, []
+            return steps, [], metadata
         # Handle Makefile variants (GNUmakefile, Makefile, makefile)
         elif any((source_path / name).exists() for name in ("Makefile", "GNUmakefile", "makefile")):
             Colors.print("Detected Makefile", Colors.OKBLUE)
@@ -144,9 +279,7 @@ class AutoBuilder:
             make_bin = shutil.which("make") or shutil.which("gmake") or shutil.which("mingw32-make") or shutil.which("nmake")
             if not make_bin:
                 Colors.print("Make not found on PATH. Please install build tools or use anvil.json.", Colors.WARNING)
-                return [], []
-
-            # Quote install path
+                return [], [], metadata
             install_prefix_str = str(install_prefix)
             # On many projects, 'make install' responds to PREFIX= or DESTDIR=.
             # We prefer to only run 'make install' when an 'install' target exists; otherwise,
@@ -175,18 +308,30 @@ class AutoBuilder:
                 if (source_path / 'go.mod').exists():
                     bin_name = source_path.name
                     steps.append(f"go build -o \"{install_prefix / 'bin' / bin_name}\" ./...")
-                    return steps, [bin_name]
+                    return steps, [bin_name], metadata
                 steps.append(AutoBuilder._copy_build_bins)
-            return steps, []
-        elif (source_path / "CMakeLists.txt").exists():
+            return steps, [], metadata
+        if (source_path / "CMakeLists.txt").exists():
             Colors.print("Detected CMake project", Colors.OKBLUE)
+            cmake_args = f"-DCMAKE_INSTALL_PREFIX={install_prefix}"
+            # If building on Windows with MSVC, select the matching runtime.
+            if os.name == 'nt':
+                # Prefer env var override; otherwise default to MultiThreadedDLL.
+                requested = os.environ.get('ANVIL_MSVC_RUNTIME', '').strip().upper()
+                requested = metadata.get('msvc_runtime', requested) if metadata else requested
+                if requested == 'MT':
+                    cmake_flag = 'MultiThreaded'
+                else:
+                    cmake_flag = 'MultiThreadedDLL'
+                cmake_args += f" -DCMAKE_MSVC_RUNTIME_LIBRARY={cmake_flag} -A x64"
+                # Use PowerShell style make (nmake/mingw) automatically should be chosen by the project's CMake
             steps = [
                 "mkdir -p build",
-                f"cd build && cmake .. -DCMAKE_INSTALL_PREFIX={install_prefix}",
+                f"cd build && cmake .. {cmake_args}",
                 "cd build && make",
                 "cd build && make install"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "Cargo.toml").exists():
             Colors.print("Detected Rust project", Colors.OKBLUE)
             is_virtual_workspace = False
@@ -216,7 +361,7 @@ class AutoBuilder:
                         "cargo build --release",
                         AutoBuilder._copy_cargo_libs
                     ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "go.mod").exists() or (source_path / "main.go").exists() or any(source_path.glob("*.go")):
             Colors.print("Detected Go project (go.mod)", Colors.OKBLUE)
             # Prefer module-aware install if go 1.18+ and module path; otherwise build
@@ -227,23 +372,23 @@ class AutoBuilder:
                 steps = [
                     f"go build -o \"{install_prefix / 'bin' / binary_name}\"",
                 ]
-                return steps, [binary_name]
+                return steps, [binary_name], metadata
             else:
                 Colors.print('No Go binary found (library-only module). Skipping direct build.', Colors.WARNING)
-                return [], []
+                return [], [], metadata
         elif (source_path / "package.json").exists():
             Colors.print("Detected Node.js project (package.json)", Colors.OKBLUE)
             steps = [
                 "npm install",
                 "npm run build || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "pyproject.toml").exists():
             Colors.print("Detected Python project (pyproject.toml)", Colors.OKBLUE)
             steps = [
                 f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "meson.build").exists():
             Colors.print("Detected Meson project (meson.build)", Colors.OKBLUE)
             steps = [
@@ -251,14 +396,14 @@ class AutoBuilder:
                 "ninja -C build",
                 f"ninja -C build install --destdir={install_prefix} || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "SConstruct").exists():
             Colors.print("Detected SCons project (SConstruct)", Colors.OKBLUE)
             steps = [
                 f"scons PREFIX={install_prefix}",
                 f"scons install PREFIX={install_prefix} || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "build.gradle").exists() or (source_path / "gradlew").exists():
             Colors.print("Detected Gradle project (build.gradle)", Colors.OKBLUE)
             gradle_cmd = "./gradlew" if (source_path / "gradlew").exists() else "gradle"
@@ -266,34 +411,34 @@ class AutoBuilder:
                 f"{gradle_cmd} build",
                 f"cp -r build/libs/* {install_prefix}/ || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "WORKSPACE").exists() or (source_path / "BUILD").exists():
             Colors.print("Detected Bazel project (WORKSPACE/BUILD)", Colors.OKBLUE)
             steps = [
                 "bazel build //...",
                 f"cp -r bazel-bin/* {install_prefix}/ || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif any(source_path.glob('*.csproj')):
             Colors.print("Detected .NET project (csproj)", Colors.OKBLUE)
             steps = [
                 f"dotnet publish -c Release -o {install_prefix}"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "build.zig").exists() or (source_path / "zig.toml").exists():
             Colors.print("Detected Zig project (build.zig)", Colors.OKBLUE)
             steps = [
                 "zig build -Drelease-safe",
                 f"cp zig-out/bin/* {install_prefix / 'bin'} || true"
             ]
-            return steps, []
+            return steps, [], metadata
         elif (source_path / "pom.xml").exists():
             Colors.print("Detected Java project (pom.xml)", Colors.OKBLUE)
             steps = [
                 "mvn package",
                 f"cp target/*.jar {install_prefix}/"
             ]
-            return steps, []
+            return steps, [], metadata
         else:
             # Archives (.tar.xz, .7z, etc.)
             for ext in [".tar.xz", ".7z", ".tar.bz2", ".tar.gz", ".tgz", ".tar", ".zip"]:
@@ -303,18 +448,18 @@ class AutoBuilder:
                         steps = [f"unzip -o {file} -d {install_prefix}"]
                     else:
                         steps = [f"tar -xf {file} -C {install_prefix}"]
-                    return steps, []
+                    return steps, [], metadata
             if (source_path / ".hg").exists():
                 Colors.print("Detected Mercurial repository", Colors.OKBLUE)
                 steps = ["hg pull", "hg update"]
-                return steps, []
+                return steps, [], metadata
             if (source_path / ".svn").exists():
                 Colors.print("Detected SVN repository", Colors.OKBLUE)
                 steps = ["svn update"]
-                return steps, []
+                return steps, [], metadata
             Colors.print("No build system detected. Copying files as-is.", Colors.WARNING)
             steps = [f"cp -r ./* {install_prefix}/"]
-            return steps, []
+            return steps, [], metadata
 
 
     @staticmethod
@@ -656,7 +801,7 @@ class Anvil:
                         Colors.print(f"Failed to remove binary: {bin_file.name} ({e})", Colors.WARNING)
         Colors.print("Housekeeping complete.", Colors.OKGREEN)
 
-    def forge(self, target):
+    def forge(self, target, msvc_runtime=None, force_pic=None):
         """
         Target can be:
         1. A package name in the index (e.g., 'htop')
@@ -727,13 +872,35 @@ class Anvil:
             run_cmd(f"git clone --depth 1 {url} .", cwd=build_path)
 
         # Auto-Detect Build System
-        steps, binaries = AutoBuilder.detect(build_path, install_path)
+        steps, binaries, metadata = AutoBuilder.detect(build_path, install_path)
 
         # Build
         Colors.print("Forging (Building)...", Colors.OKBLUE)
         if install_path.exists():
             safe_rmtree(install_path)
         install_path.mkdir(parents=True, exist_ok=True)
+
+        # Prepare a platform-sensitive build env for all build steps so
+        # that different compilers used by multi-stage builds consistently
+        # link against the same C runtime (particularly on Windows/MSVC).
+        # Determine the overrides precedence: CLI args > per-formula metadata > environment
+        msvc_override = msvc_runtime if msvc_runtime is not None else metadata.get('msvc_runtime')
+        force_pic_override = force_pic if force_pic is not None else metadata.get('force_pic')
+        build_env = default_build_env(msvc_runtime_override=msvc_override, force_pic_override=force_pic_override)
+        # Post-process CMake steps to inject MSVC runtime choice (if detected) so cmake call uses -D flag
+        if os.name == 'nt' and msvc_override:
+            cmake_flag = 'MultiThreaded' if str(msvc_override).strip().upper() == 'MT' else 'MultiThreadedDLL'
+            processed_steps = []
+            for step in steps:
+                if isinstance(step, str) and 'cmake ' in step and 'CMAKE_MSVC_RUNTIME_LIBRARY' not in step:
+                    step = step + f" -DCMAKE_MSVC_RUNTIME_LIBRARY={cmake_flag}"
+                elif isinstance(step, str) and 'cmake ' in step and 'CMAKE_MSVC_RUNTIME_LIBRARY' in step:
+                    # Replace existing flag
+                    step = re.sub(r"-DCMAKE_MSVC_RUNTIME_LIBRARY=[^\s]+", f"-DCMAKE_MSVC_RUNTIME_LIBRARY={cmake_flag}", step)
+                processed_steps.append(step)
+            steps = processed_steps
+        if os.name == 'nt':
+            Colors.print(f"Enforcing MSVC runtime in build environment (CL='{build_env.get('CL','')}', CMAKE_MSVC_RUNTIME_LIBRARY='{build_env.get('CMAKE_MSVC_RUNTIME_LIBRARY','')}')", Colors.OKBLUE)
 
         for step in steps:
             # Step can be a string (shell command) or a callable (python function)
@@ -748,7 +915,17 @@ class Anvil:
                 else:
                     rendered = step
                 Colors.print(f"Running: {rendered}")
-                run_cmd(rendered, cwd=build_path)
+                try:
+                    run_cmd(rendered, cwd=build_path, env=build_env)
+                except CommandExecutionError as cee:
+                    # Analyze stderr for common link/runtime issues and provide suggestions
+                    suggestions = detect_lnk_and_pic_issues(getattr(cee, 'stderr', ''))
+                    if suggestions:
+                        Colors.print("Build failed with suggestions:", Colors.WARNING)
+                        for s in suggestions:
+                            Colors.print(f"  {s}", Colors.WARNING)
+                    # Re-raise to keep existing behavior (exit or raise)
+                    raise
 
         # Link Binaries (Heuristic + Explicit)
         self._link_binaries(install_path, binaries)
@@ -844,7 +1021,10 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # FORGE: The main tool. Accepts Name, URL, or Path.
-    subparsers.add_parser("forge", help="Install from Index, URL, or Path").add_argument("target")
+    forge_parser = subparsers.add_parser("forge", help="Install from Index, URL, or Path")
+    forge_parser.add_argument("target")
+    forge_parser.add_argument("--msvc-runtime", choices=['MD', 'MT'], help="Override MSVC runtime used for builds (MD or MT)")
+    forge_parser.add_argument("--force-pic", action='store_true', help="Force -fPIC on POSIX builds (overrides env/meta)")
 
     # SUBMIT: Add to index
     subparsers.add_parser("submit", help="Add URL to index").add_argument("url")
@@ -858,7 +1038,7 @@ def main():
     anvil = Anvil()
 
     if args.command == "forge":
-        anvil.forge(args.target)
+        anvil.forge(args.target, msvc_runtime=args.msvc_runtime, force_pic=args.force_pic)
     elif args.command == "submit":
         anvil.submit(args.url)
     elif args.command == "update":
