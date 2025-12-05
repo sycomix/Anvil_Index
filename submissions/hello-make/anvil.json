@@ -1,0 +1,14 @@
+{
+  "name": "hello-make",
+  "version": "0.1",
+  "description": "Simple C program built with Makefile for Anvil testing",
+  "url": "https://github.com/example/hello-make.git",
+  "type": "git",
+  "binaries": ["hello"],
+  "build": {
+    "common": [
+      "make",
+      "make install DESTDIR={PREFIX}"
+    ]
+  }
+}

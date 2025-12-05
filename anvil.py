@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Anvil - a small source-based package manager (forging packages from source and managing an index)."""
 import os
 import sys
 import json
@@ -8,8 +9,7 @@ import argparse
 import platform
 import urllib.request
 import urllib.parse
-import tarfile
-import zipfile
+# tarfile and zipfile removed; using shell tools in AutoBuilder
 import sqlite3
 from pathlib import Path
 import stat
@@ -27,6 +27,7 @@ BIN_DIR = ANVIL_ROOT / "bin"
 INDEX_REPO_URL = "https://github.com/sycomix/Anvil_Index.git"
 
 class Colors:
+    """Console color helpers used for printing status messages."""
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKGREEN = '\033[92m'
@@ -44,6 +45,11 @@ class Colors:
 
 # --- Utilities ---
 def run_cmd(command, cwd=None, shell=True, verbose=True):
+    """Run a shell command and return on success.
+
+    If the command fails, prints an error and exits unless the command is
+    a git command, in which case the original exception is re-raised.
+    """
     try:
         if verbose:
             subprocess.check_call(command, cwd=cwd, shell=shell)
@@ -51,25 +57,37 @@ def run_cmd(command, cwd=None, shell=True, verbose=True):
             subprocess.check_call(command, cwd=cwd, shell=shell, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         Colors.print(f"Command failed: {command}", Colors.FAIL)
-        if "git" in command: raise
+        if "git" in command:
+            raise
         sys.exit(1)
+
+def run_cmd_output(command, cwd=None, shell=True):
+    """Run a command and return its stdout or None if the command fails.
+
+    This function is a convenience wrapper around subprocess.check_output,
+    returning None on failure so callers can detect absence of output.
+    """
+    try:
+        out = subprocess.check_output(command, cwd=cwd, shell=shell, stderr=subprocess.DEVNULL)
+        return out.decode('utf-8').strip()
+    except subprocess.CalledProcessError:
+        return None
 
 
 def _on_rm_error(func, path, exc_info):
     """Error handler for shutil.rmtree to handle read-only files on Windows.
     Tries to make file writable and retries the operation.
     """
-    import errno
     # Only handle permission errors
     if not os.access(path, os.W_OK):
         try:
             os.chmod(path, stat.S_IWRITE)
             func(path)
-        except Exception:
-            Colors.print(f"Failed to remove {path}: {exc_info}", Colors.FAIL)
+        except OSError as e:
+            Colors.print(f"Failed to remove {path}: {exc_info} ({e})", Colors.FAIL)
     else:
-        # Raise if it's a different error
-        raise
+        # Raise if it's a different error - re-raise the original exception object
+        raise exc_info[1]
 
 
 def safe_rmtree(path, retries: int = 3, delay: float = 0.5):
@@ -84,7 +102,7 @@ def safe_rmtree(path, retries: int = 3, delay: float = 0.5):
         try:
             shutil.rmtree(path, onerror=_on_rm_error)
             return
-        except Exception as e:
+        except OSError as e:
             last_err = e
             Colors.print(f"Retrying removal of {path}: {e}", Colors.WARNING)
             time.sleep(delay)
@@ -101,10 +119,9 @@ class AutoBuilder:
     @staticmethod
     def detect(source_path, install_prefix):
         steps = []
-        binaries = []
         # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
         if (source_path / "anvil.json").exists():
-            with open(source_path / "anvil.json") as f:
+            with open(source_path / "anvil.json", encoding='utf-8') as f:
                 data = json.load(f)
                 build_deps = data.get("build_dependencies", [])
                 if build_deps:
@@ -120,11 +137,22 @@ class AutoBuilder:
             Colors.print("Detected Python requirements", Colors.OKBLUE)
             steps = [f"{sys.executable} -m pip install -r requirements.txt --target {install_prefix}"]
             return steps, []
-        elif (source_path / "Makefile").exists():
+        # Handle Makefile variants (GNUmakefile, Makefile, makefile)
+        elif any((source_path / name).exists() for name in ("Makefile", "GNUmakefile", "makefile")):
             Colors.print("Detected Makefile", Colors.OKBLUE)
+            # Determine which make binary is available (gmake, make, mingw32-make, nmake)
+            make_bin = shutil.which("make") or shutil.which("gmake") or shutil.which("mingw32-make") or shutil.which("nmake")
+            if not make_bin:
+                Colors.print("Make not found on PATH. Please install build tools or use anvil.json.", Colors.WARNING)
+                return [], []
+
+            # Quote install path
+            install_prefix_str = str(install_prefix)
+            # On many projects, 'make install' responds to PREFIX= or DESTDIR=
             steps = [
-                "make",
-                f"make install PREFIX={install_prefix}"
+                f"{make_bin}",
+                f"{make_bin} install PREFIX=\"{install_prefix_str}\"",
+                f"{make_bin} install DESTDIR=\"{install_prefix_str}\""
             ]
             return steps, []
         elif (source_path / "CMakeLists.txt").exists():
@@ -144,7 +172,9 @@ class AutoBuilder:
                     content = f.read()
                     if "[workspace]" in content and "[package]" not in content:
                         is_virtual_workspace = True
-            except: pass
+            except (OSError, UnicodeDecodeError):
+                # If reading the file fails, treat as not a workspace and continue
+                pass
             # Workspace: build all, then copy any bins and libs
             if is_virtual_workspace:
                 Colors.print("Detected Cargo Workspace. Building release target...", Colors.OKBLUE)
@@ -164,17 +194,74 @@ class AutoBuilder:
                         AutoBuilder._copy_cargo_libs
                     ]
             return steps, []
-        elif (source_path / "go.mod").exists():
+        elif (source_path / "go.mod").exists() or (source_path / "main.go").exists() or any(source_path.glob("*.go")):
             Colors.print("Detected Go project (go.mod)", Colors.OKBLUE)
-            steps = [
-                f"go build -o {install_prefix / 'bin' / source_path.name}",
-            ]
-            return steps, [source_path.name]
+            # Prefer module-aware install if go 1.18+ and module path; otherwise build
+            # If there's a single main package with main.go, we'll build a single binary
+            # Only build a binary if main.go or cmd/ exists
+            if (source_path / 'main.go').exists() or ((source_path / 'cmd').exists() and any((source_path / 'cmd').rglob('*.go'))):
+                binary_name = source_path.name
+                steps = [
+                    f"go build -o {install_prefix / 'bin' / binary_name}",
+                ]
+                return steps, [binary_name]
+            else:
+                Colors.print('No Go binary found (library-only module). Skipping direct build.', Colors.WARNING)
+                return [], []
         elif (source_path / "package.json").exists():
             Colors.print("Detected Node.js project (package.json)", Colors.OKBLUE)
             steps = [
                 "npm install",
                 "npm run build || true"
+            ]
+            return steps, []
+        elif (source_path / "pyproject.toml").exists():
+            Colors.print("Detected Python project (pyproject.toml)", Colors.OKBLUE)
+            steps = [
+                f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
+            ]
+            return steps, []
+        elif (source_path / "meson.build").exists():
+            Colors.print("Detected Meson project (meson.build)", Colors.OKBLUE)
+            steps = [
+                "meson setup build",
+                "ninja -C build",
+                f"ninja -C build install --destdir={install_prefix} || true"
+            ]
+            return steps, []
+        elif (source_path / "SConstruct").exists():
+            Colors.print("Detected SCons project (SConstruct)", Colors.OKBLUE)
+            steps = [
+                f"scons PREFIX={install_prefix}",
+                f"scons install PREFIX={install_prefix} || true"
+            ]
+            return steps, []
+        elif (source_path / "build.gradle").exists() or (source_path / "gradlew").exists():
+            Colors.print("Detected Gradle project (build.gradle)", Colors.OKBLUE)
+            gradle_cmd = "./gradlew" if (source_path / "gradlew").exists() else "gradle"
+            steps = [
+                f"{gradle_cmd} build",
+                f"cp -r build/libs/* {install_prefix}/ || true"
+            ]
+            return steps, []
+        elif (source_path / "WORKSPACE").exists() or (source_path / "BUILD").exists():
+            Colors.print("Detected Bazel project (WORKSPACE/BUILD)", Colors.OKBLUE)
+            steps = [
+                "bazel build //...",
+                f"cp -r bazel-bin/* {install_prefix}/ || true"
+            ]
+            return steps, []
+        elif any(source_path.glob('*.csproj')):
+            Colors.print("Detected .NET project (csproj)", Colors.OKBLUE)
+            steps = [
+                f"dotnet publish -c Release -o {install_prefix}"
+            ]
+            return steps, []
+        elif (source_path / "build.zig").exists() or (source_path / "zig.toml").exists():
+            Colors.print("Detected Zig project (build.zig)", Colors.OKBLUE)
+            steps = [
+                "zig build -Drelease-safe",
+                f"cp zig-out/bin/* {install_prefix / 'bin'} || true"
             ]
             return steps, []
         elif (source_path / "pom.xml").exists():
@@ -186,10 +273,13 @@ class AutoBuilder:
             return steps, []
         else:
             # Archives (.tar.xz, .7z, etc.)
-            for ext in [".tar.xz", ".7z", ".tar.bz2"]:
+            for ext in [".tar.xz", ".7z", ".tar.bz2", ".tar.gz", ".tgz", ".tar", ".zip"]:
                 for file in source_path.glob(f"*{ext}"):
                     Colors.print(f"Detected archive: {file.name}", Colors.OKBLUE)
-                    steps = [f"tar -xf {file} -C {install_prefix}"]
+                    if ext == ".zip":
+                        steps = [f"unzip -o {file} -d {install_prefix}"]
+                    else:
+                        steps = [f"tar -xf {file} -C {install_prefix}"]
                     return steps, []
             if (source_path / ".hg").exists():
                 Colors.print("Detected Mercurial repository", Colors.OKBLUE)
@@ -221,24 +311,7 @@ class AutoBuilder:
         else:
             Colors.print("Unknown platform for dependency installation.", Colors.WARNING)
 
-    def housekeeping(self):
-        """
-        Cleans up build directories, orphaned binaries, and unused dependencies.
-        """
-        Colors.print("Running housekeeping...", Colors.HEADER)
-        # Remove build directory
-        if BUILD_DIR.exists():
-            safe_rmtree(BUILD_DIR)
-            Colors.print("Build directory cleaned.", Colors.OKGREEN)
-        # Remove orphaned binaries (not in installed packages)
-        installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
-        for bin_file in BIN_DIR.iterdir():
-            if bin_file.is_file():
-                name = bin_file.stem
-                if name not in installed:
-                    bin_file.unlink()
-                    Colors.print(f"Removed orphaned binary: {bin_file.name}", Colors.OKBLUE)
-        Colors.print("Housekeeping complete.", Colors.OKGREEN)
+    # Removed from AutoBuilder; housekeeping belongs on the Anvil instance
 
     @staticmethod
     def _copy_cargo_bins(build_path, install_path):
@@ -253,8 +326,9 @@ class AutoBuilder:
 
         count = 0
         for item in release_dir.iterdir():
-            if not item.is_file(): continue
-            
+            if not item.is_file():
+                continue
+
             # Windows: Check for .exe
             if os.name == 'nt':
                 if item.suffix == '.exe':
@@ -315,7 +389,8 @@ class AutoBuilder:
                 content = toml_path.read_text(encoding='utf-8')
                 if "[[bin]]" in content:
                     return True
-        except Exception:
+        except (OSError, UnicodeDecodeError):
+            # File not found or decode error - treat as no explicit [[bin]] entries
             pass
         return False
 
@@ -323,6 +398,7 @@ class AutoBuilder:
 # --- Index Management ---
 
 class RepoIndex:
+    """Manage the local sqlite index of repository metadata and sync with the central index."""
     def __init__(self):
         self.db_path = INDEX_DIR / "index.db"
         self._ensure_exists()
@@ -333,7 +409,9 @@ class RepoIndex:
             try:
                 # Try to clone index, but don't fail if offline/empty
                 run_cmd(f"git clone {INDEX_REPO_URL} .", cwd=INDEX_DIR, verbose=False)
-            except: pass
+            except (subprocess.CalledProcessError, OSError):
+                # Ignore clone errors (no network or git missing)
+                pass
         
         if not self.db_path.exists():
             self._create_bootstrap_db()
@@ -355,6 +433,13 @@ class RepoIndex:
             result = c.fetchone()
             return result[0] if result else None
 
+    def has_url(self, url):
+        """Return True if the given URL is already present in the index DB."""
+        with sqlite3.connect(self.db_path) as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM repositories WHERE url=?", (url,))
+            return bool(c.fetchone())
+
     def add_local(self, name, url):
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
@@ -366,11 +451,14 @@ class RepoIndex:
             Colors.print("Syncing Central Index...", Colors.HEADER)
             try:
                 run_cmd("git pull", cwd=INDEX_DIR, verbose=False)
-            except: pass
+            except (subprocess.CalledProcessError, OSError):
+                # If pull fails, ignore and continue
+                pass
 
 # --- Main App ---
 
 class Anvil:
+    """Main CLI class responsible for forging packages, submitting repos, and housekeeping."""
     def __init__(self):
         self._setup_dirs()
         self._ensure_path()
@@ -384,6 +472,28 @@ class Anvil:
         if str(BIN_DIR) not in os.environ["PATH"]:
             Colors.print(f"WARNING: Add {BIN_DIR} to your PATH.", Colors.WARNING)
 
+    def housekeeping(self):
+        """
+        Cleans up build directories, orphaned binaries, and unused dependencies.
+        """
+        Colors.print("Running housekeeping...", Colors.HEADER)
+        # Remove build directory
+        if BUILD_DIR.exists():
+            safe_rmtree(BUILD_DIR)
+            Colors.print("Build directory cleaned.", Colors.OKGREEN)
+        # Remove orphaned binaries (not in installed packages)
+        installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
+        for bin_file in BIN_DIR.iterdir():
+            if bin_file.is_file():
+                name = bin_file.stem
+                if name not in installed:
+                    try:
+                        bin_file.unlink()
+                        Colors.print(f"Removed orphaned binary: {bin_file.name}", Colors.OKBLUE)
+                    except OSError as e:
+                        Colors.print(f"Failed to remove binary: {bin_file.name} ({e})", Colors.WARNING)
+        Colors.print("Housekeeping complete.", Colors.OKGREEN)
+
     def forge(self, target):
         """
         Target can be:
@@ -394,18 +504,32 @@ class Anvil:
         
         url = None
         name = None
+        source_remote = None
 
         # 1. Check if it's a URL
         if target.startswith("http") or target.startswith("git@"):
             url = target
             name = target.split("/")[-1].replace(".git", "")
+            # Remote URL
             Colors.print(f"Direct Forge: {name} from {url}", Colors.HEADER)
 
         # 2. Check if it's a local path
         elif os.path.exists(target) and os.path.isdir(target):
-            url = str(Path(target).resolve())
-            name = Path(target).name
-            Colors.print(f"Local Forge: {name} from {url}", Colors.HEADER)
+            # Local copy. Determine if it's a Git repo and try to find a remote URL.
+            src_path = Path(target)
+            name = src_path.name
+            Colors.print(f"Local Forge: {name} from {src_path}", Colors.HEADER)
+            # Detect git remote origin if present
+            git_dir = src_path / '.git'
+            if git_dir.exists():
+                try:
+                    source_remote = run_cmd_output(
+                        'git config --get remote.origin.url', cwd=str(src_path)
+                    )
+                    if source_remote:
+                        url = source_remote
+                except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+                    source_remote = None
 
         # 3. Check Index
         else:
@@ -420,24 +544,33 @@ class Anvil:
         build_path = BUILD_DIR / name
         install_path = INSTALL_DIR / name
 
-        if build_path.exists(): safe_rmtree(build_path)
+        if build_path.exists():
+            safe_rmtree(build_path)
         build_path.mkdir()
 
         # Fetch Source
         if os.path.exists(target) and os.path.isdir(target):
-             # Local copy
-             run_cmd(f"cp -r {target}/. {build_path}/")
+            # Local copy - use shutil for cross-platform copies instead of shell 'cp'
+            Colors.print("Copying local source to build dir...", Colors.OKBLUE)
+            src_path = Path(target)
+            for item in src_path.iterdir():
+                dest = build_path / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
         else:
-             # Git clone
-             Colors.print("Cloning source...", Colors.OKBLUE)
-             run_cmd(f"git clone --depth 1 {url} .", cwd=build_path)
+            # Git clone
+            Colors.print("Cloning source...", Colors.OKBLUE)
+            run_cmd(f"git clone --depth 1 {url} .", cwd=build_path)
 
         # Auto-Detect Build System
         steps, binaries = AutoBuilder.detect(build_path, install_path)
         
         # Build
         Colors.print("Forging (Building)...", Colors.OKBLUE)
-        if install_path.exists(): safe_rmtree(install_path)
+        if install_path.exists():
+            safe_rmtree(install_path)
         install_path.mkdir(parents=True, exist_ok=True)
 
         for step in steps:
@@ -445,8 +578,13 @@ class Anvil:
             if callable(step):
                 step(build_path, install_path)
             else:
-                Colors.print(f"Running: {step}")
-                run_cmd(step, cwd=build_path)
+                # Replace known placeholders (e.g., {PREFIX}) with real paths
+                if isinstance(step, str):
+                    rendered = step.replace("{PREFIX}", str(install_path))
+                else:
+                    rendered = step
+                Colors.print(f"Running: {rendered}")
+                run_cmd(rendered, cwd=build_path)
 
         # Link Binaries (Heuristic + Explicit)
         self._link_binaries(install_path, binaries)
@@ -454,6 +592,19 @@ class Anvil:
         # Cleanup
         safe_rmtree(build_path)
         Colors.print(f"Successfully forged {name}!", Colors.OKGREEN)
+        # If we installed from a git repo (URL or local git with a remote) and that remote
+        # isn't in the local index yet, auto-submit it to produce a PR for maintainers.
+        try:
+            final_url = None
+            if source_remote:
+                final_url = source_remote
+            elif url and (url.startswith('http') or url.startswith('git@')):
+                final_url = url
+            if final_url and not self.index.has_url(final_url):
+                Colors.print(f"Repository {final_url} not found in index — submitting a PR to add it.", Colors.HEADER)
+                self.submit(final_url)
+        except (sqlite3.Error, subprocess.CalledProcessError, OSError, ValueError):
+            Colors.print("Auto submission failed; continuing without PR", Colors.WARNING)
 
     def _link_binaries(self, install_path, explicit_binaries):
         """
@@ -475,11 +626,13 @@ class Anvil:
             candidates.extend(list(install_path.rglob(b)))
 
         # 3. Link
-        for src in set(candidates): # set for unique
-            if src.name.startswith("."): continue # skip hidden
+        for src in set(candidates):  # set for unique
+            if src.name.startswith("."):
+                # skip hidden
+                continue
             
             dest = BIN_DIR / src.name
-            if dest.exists(): 
+            if dest.exists():
                 try:
                     dest.unlink()
                 except PermissionError:
@@ -487,16 +640,14 @@ class Anvil:
                     try:
                         os.chmod(dest, stat.S_IWRITE)
                         dest.unlink()
-                    except Exception as e:
+                    except OSError as e:
                         Colors.print(f"Could not remove old link {dest}: {e}", Colors.WARNING)
 
             Colors.print(f"Linking {src.name}...", Colors.OKBLUE)
             if os.name == 'nt':
                 # Windows Shim
-                with open(str(dest) + ".bat", 'w') as bat:
+                with open(str(dest) + ".bat", 'w', encoding='utf-8') as bat:
                     bat.write(f"@echo off\n\"{src}\" %*")
-            else:
-                os.symlink(src, dest)
 
     def submit(self, url):
         """Simple submission: Just URL and Name."""
@@ -539,14 +690,19 @@ def main():
     args = parser.parse_args()
     anvil = Anvil()
 
-    if args.command == "forge": anvil.forge(args.target)
-    elif args.command == "submit": anvil.submit(args.url)
-    elif args.command == "update": anvil.index.update()
-    elif args.command == "list": 
-        for p in INSTALL_DIR.iterdir(): print(p.name)
+    if args.command == "forge":
+        anvil.forge(args.target)
+    elif args.command == "submit":
+        anvil.submit(args.url)
+    elif args.command == "update":
+        anvil.index.update()
+    elif args.command == "list":
+        for p in INSTALL_DIR.iterdir():
+            print(p.name)
     elif args.command == "housekeeping":
         anvil.housekeeping()
-    else: parser.print_help()
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,14 @@
+{
+  "name": "hello-make-simple",
+  "version": "0.1",
+  "description": "Simple Makefile that writes a file using Python to avoid compiler requirements",
+  "url": "https://github.com/example/hello-make-simple.git",
+  "type": "git",
+  "binaries": ["hello"],
+  "build": {
+    "common": [
+      "make",
+      "make install DESTDIR={PREFIX}"
+    ]
+  }
+}
