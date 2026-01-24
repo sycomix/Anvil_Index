@@ -442,7 +442,7 @@ class AutoBuilder:
             Colors.print("Detected Swift project (Package.swift)", Colors.OKBLUE)
             steps = [
                 "swift build -c release",
-                f"cp .build/release/* {install_prefix}/bin/ 2>/dev/null || true"
+                AutoBuilder._copy_swift_artifacts
             ]
             return steps, [], metadata
         elif (source_path / "SConstruct").exists():
@@ -457,14 +457,14 @@ class AutoBuilder:
             gradle_cmd = "./gradlew" if (source_path / "gradlew").exists() else "gradle"
             steps = [
                 f"{gradle_cmd} build",
-                f"cp -r build/libs/* {install_prefix}/ || true"
+                AutoBuilder._copy_gradle_artifacts
             ]
             return steps, [], metadata
         elif (source_path / "WORKSPACE").exists() or (source_path / "BUILD").exists():
             Colors.print("Detected Bazel project (WORKSPACE/BUILD)", Colors.OKBLUE)
             steps = [
                 "bazel build //...",
-                f"cp -r bazel-bin/* {install_prefix}/ || true"
+                AutoBuilder._copy_bazel_artifacts
             ]
             return steps, [], metadata
         elif any(source_path.glob('*.csproj')):
@@ -477,14 +477,14 @@ class AutoBuilder:
             Colors.print("Detected Zig project (build.zig)", Colors.OKBLUE)
             steps = [
                 "zig build -Drelease-safe",
-                f"cp zig-out/bin/* {install_prefix / 'bin'} || true"
+                AutoBuilder._copy_zig_artifacts
             ]
             return steps, [], metadata
         elif (source_path / "pom.xml").exists():
             Colors.print("Detected Java project (pom.xml)", Colors.OKBLUE)
             steps = [
                 "mvn package",
-                f"cp target/*.jar {install_prefix}/"
+                AutoBuilder._copy_maven_artifacts
             ]
             return steps, [], metadata
         else:
@@ -506,7 +506,7 @@ class AutoBuilder:
                 steps = ["svn update"]
                 return steps, [], metadata
             Colors.print("No build system detected. Copying files as-is.", Colors.WARNING)
-            steps = [f"cp -r ./* {install_prefix}/"]
+            steps = [AutoBuilder._copy_all]
             return steps, [], metadata
 
 
@@ -628,6 +628,67 @@ class AutoBuilder:
 
         if count == 0:
             Colors.print("Warning: No library artifacts found in target/release", Colors.WARNING)
+
+    @staticmethod
+    def _copy_all(build_path, install_path):
+        """Copy all files from build_path to install_path."""
+        Colors.print(f"Copying all files to {install_path}...", Colors.OKBLUE)
+        if hasattr(shutil, 'copytree'):
+            # Python 3.8+ handles existing dest with dirs_exist_ok=True
+            shutil.copytree(build_path, install_path, dirs_exist_ok=True)
+        else:
+            # Fallback for older python if needed, though 3.12 is required per comments
+            # But let's be safe: iterate and copy
+             for item in build_path.iterdir():
+                dest = install_path / item.name
+                if item.is_dir():
+                    if dest.exists():
+                        safe_rmtree(dest)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+
+    @staticmethod
+    def _copy_gradle_artifacts(build_path, install_path):
+        src = build_path / "build" / "libs"
+        if not src.exists(): return
+        for item in src.iterdir():
+            shutil.copy2(item, install_path)
+
+    @staticmethod
+    def _copy_bazel_artifacts(build_path, install_path):
+        src = build_path / "bazel-bin"
+        if not src.exists(): return
+        if hasattr(shutil, 'copytree'):
+             shutil.copytree(src, install_path, dirs_exist_ok=True)
+
+    @staticmethod
+    def _copy_zig_artifacts(build_path, install_path):
+        src = build_path / "zig-out" / "bin"
+        dest = install_path / "bin"
+        dest.mkdir(parents=True, exist_ok=True)
+        if not src.exists(): return
+        for item in src.iterdir():
+            shutil.copy2(item, dest)
+
+    @staticmethod
+    def _copy_maven_artifacts(build_path, install_path):
+        src = build_path / "target"
+        if not src.exists(): return
+        for item in src.glob("*.jar"):
+            shutil.copy2(item, install_path)
+
+    @staticmethod
+    def _copy_swift_artifacts(build_path, install_path):
+        src = build_path / ".build" / "release"
+        dest = install_path / "bin"
+        dest.mkdir(parents=True, exist_ok=True)
+        if not src.exists(): return
+        for item in src.iterdir():
+             if item.is_file() and os.access(item, os.X_OK):
+                shutil.copy2(item, dest)
+             elif os.name == 'nt' and item.suffix == '.exe':
+                shutil.copy2(item, dest)
 
     @staticmethod
     def _has_cargo_binary(source_path):
