@@ -249,6 +249,15 @@ class AutoBuilder:
     without requiring a formula file.
     """
     @staticmethod
+    def _get_parallel_jobs():
+        """Return the number of parallel jobs to use for builds (e.g. -j4)."""
+        try:
+            count = os.cpu_count() or 1
+            return str(count)
+        except Exception:
+            return "1"
+
+    @staticmethod
     def detect(source_path, install_prefix):
         steps = []
         metadata = {}
@@ -272,6 +281,16 @@ class AutoBuilder:
             Colors.print("Detected Python requirements", Colors.OKBLUE)
             steps = [f"{sys.executable} -m pip install -r requirements.txt --target {install_prefix}"]
             return steps, [], metadata
+        # Handle Autotools (configure script)
+        elif (source_path / "configure").exists():
+            Colors.print("Detected Autotools project (configure)", Colors.OKBLUE)
+            install_prefix_str = str(install_prefix).replace('\\', '/')
+            steps = [
+                f"./configure --prefix=\"{install_prefix_str}\"",
+                f"make -j{AutoBuilder._get_parallel_jobs()}",
+                f"make install"
+            ]
+            return steps, [], metadata
         # Handle Makefile variants (GNUmakefile, Makefile, makefile)
         elif any((source_path / name).exists() for name in ("Makefile", "GNUmakefile", "makefile")):
             Colors.print("Detected Makefile", Colors.OKBLUE)
@@ -280,6 +299,12 @@ class AutoBuilder:
             if not make_bin:
                 Colors.print("Make not found on PATH. Please install build tools or use anvil.json.", Colors.WARNING)
                 return [], [], metadata
+            
+            jobs = f"-j{AutoBuilder._get_parallel_jobs()}"
+            # nmake doesn't support -j
+            if "nmake" in make_bin:
+                jobs = ""
+
             install_prefix_str = str(install_prefix)
             # On many projects, 'make install' responds to PREFIX= or DESTDIR=.
             # We prefer to only run 'make install' when an 'install' target exists; otherwise,
@@ -296,7 +321,7 @@ class AutoBuilder:
                     except (OSError, UnicodeDecodeError):
                         # If we cannot read the file, assume no install target
                         install_target = False
-            steps = [f"{make_bin}"]
+            steps = [f"{make_bin} {jobs}"]
             if install_target:
                 steps.extend([
                     f"{make_bin} install PREFIX=\"{install_prefix_str}\"",
@@ -328,7 +353,7 @@ class AutoBuilder:
             steps = [
                 "mkdir -p build",
                 f"cd build && cmake .. {cmake_args}",
-                "cd build && make",
+                f"cd build && make -j{AutoBuilder._get_parallel_jobs()}",
                 "cd build && make install"
             ]
             return steps, [], metadata
@@ -389,12 +414,35 @@ class AutoBuilder:
                 f"{sys.executable} -m pip install . --target {install_prefix} --upgrade"
             ]
             return steps, [], metadata
+            return steps, [], metadata
+        elif (source_path / "build.ninja").exists():
+            Colors.print("Detected Ninja project (build.ninja)", Colors.OKBLUE)
+            steps = [
+                f"ninja -j{AutoBuilder._get_parallel_jobs()}",
+                f"ninja install || true"
+            ]
+            return steps, [], metadata
         elif (source_path / "meson.build").exists():
             Colors.print("Detected Meson project (meson.build)", Colors.OKBLUE)
             steps = [
                 "meson setup build",
                 "ninja -C build",
                 f"ninja -C build install --destdir={install_prefix} || true"
+            ]
+            return steps, [], metadata
+        elif any(source_path.glob("*.gemspec")):
+            Colors.print("Detected Ruby project (*.gemspec)", Colors.OKBLUE)
+            gem = next(source_path.glob("*.gemspec"))
+            steps = [
+                f"gem build {gem.name}",
+                f"gem install *.gem --install-dir {install_prefix} --bindir {install_prefix}/bin --no-document"
+            ]
+            return steps, [], metadata
+        elif (source_path / "Package.swift").exists():
+            Colors.print("Detected Swift project (Package.swift)", Colors.OKBLUE)
+            steps = [
+                "swift build -c release",
+                f"cp .build/release/* {install_prefix}/bin/ 2>/dev/null || true"
             ]
             return steps, [], metadata
         elif (source_path / "SConstruct").exists():
@@ -750,6 +798,14 @@ class RepoIndex:
             url = url[:-1]
         return url.lower()
 
+    def search(self, query):
+        """Search for repositories matching the query in name or description."""
+        with sqlite3.connect(self.db_path) as conn:
+            c = conn.cursor()
+            pattern = f"%{query}%"
+            c.execute("SELECT name, description, url FROM repositories WHERE name LIKE ? OR description LIKE ?", (pattern, pattern))
+            return c.fetchall()
+
     def update(self):
         if (INDEX_DIR / ".git").exists():
             Colors.print("Syncing Central Index...", Colors.HEADER)
@@ -1015,6 +1071,68 @@ class Anvil:
         print(f"{final_url}\n")
         Colors.print("Click link to track this repo in the global index.", Colors.OKBLUE)
 
+    def search(self, query):
+        """Search for packages."""
+        results = self.index.search(query)
+        if not results:
+            Colors.print(f"No packages found matching '{query}'.", Colors.WARNING)
+            return
+        
+        Colors.print(f"Found {len(results)} packages:", Colors.HEADER)
+        for name, desc, url in results:
+            print(f"{Colors.BOLD}{name}{Colors.ENDC} - {desc} ({url})")
+
+    def uninstall(self, name):
+        """Remove a package and its binaries."""
+        install_path = INSTALL_DIR / name
+        if not install_path.exists():
+            Colors.print(f"Package '{name}' is not installed.", Colors.FAIL)
+            return
+
+        Colors.print(f"Uninstalling {name}...", Colors.HEADER)
+        
+        # 1. Remove linked binaries
+        # We check BIN_DIR for any symlinks or shims that point into the install_path.
+        count = 0
+        for bin_file in BIN_DIR.iterdir():
+            if not bin_file.is_file():
+                continue
+            
+            should_remove = False
+            try:
+                # Windows .bat shim check
+                if os.name == 'nt' and bin_file.suffix.lower() == '.bat':
+                    try:
+                        # Read the batch file to see if it points to our install dir
+                        content = bin_file.read_text(encoding='utf-8', errors='ignore')
+                        # Simple check: does the unique install path string appear in the bat file?
+                        # We use the absolute path string.
+                        if str(install_path.resolve()) in content or str(install_path) in content:
+                            should_remove = True
+                    except OSError:
+                        pass
+                
+                # Unix symlink check
+                elif bin_file.is_symlink():
+                    target = bin_file.resolve()
+                    # Check if target is inside install_path
+                    # pathlib.Path.is_relative_to() is available in Python 3.9+
+                    # We'll use string check for compatibility or try/except
+                    if str(install_path.resolve()) in str(target):
+                        should_remove = True
+
+                if should_remove:
+                    bin_file.unlink()
+                    Colors.print(f"Removed shim/link: {bin_file.name}", Colors.OKBLUE)
+                    count += 1
+
+            except OSError as e:
+                Colors.print(f"Error checking {bin_file.name}: {e}", Colors.WARNING)
+
+        # 2. Remove package directory
+        safe_rmtree(install_path)
+        Colors.print(f"Successfully uninstalled {name}.", Colors.OKGREEN)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Anvil: Source Forge")
@@ -1029,6 +1147,12 @@ def main():
     # SUBMIT: Add to index
     subparsers.add_parser("submit", help="Add URL to index").add_argument("url")
 
+    # SEARCH
+    subparsers.add_parser("search", help="Search for packages").add_argument("query")
+
+    # UNINSTALL
+    subparsers.add_parser("uninstall", help="Uninstall a package").add_argument("name")
+
     subparsers.add_parser("update", help="Update index")
     subparsers.add_parser("list", help="List installed")
 
@@ -1041,6 +1165,10 @@ def main():
         anvil.forge(args.target, msvc_runtime=args.msvc_runtime, force_pic=args.force_pic)
     elif args.command == "submit":
         anvil.submit(args.url)
+    elif args.command == "search":
+        anvil.search(args.query)
+    elif args.command == "uninstall":
+        anvil.uninstall(args.name)
     elif args.command == "update":
         anvil.index.update()
     elif args.command == "list":
