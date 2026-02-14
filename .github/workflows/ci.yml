@@ -2,13 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [ '**' ]
+    branches:
+      - '**'
   pull_request:
-    branches: [ '**' ]
+    branches:
+      - '**' 
 
 jobs:
   checks:
-    name: Static checks & ai-rules
+    name: "Static checks & ai-rules"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
