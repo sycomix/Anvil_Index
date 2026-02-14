@@ -355,9 +355,26 @@ def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:
 def safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
     """Remove directory tree safely, dealing with Windows read-only attributes.
     Retries removal a few times with small delays in case files are transiently locked.
+
+    SAFETY: refuse to remove the Anvil root, the user's HOME, or the filesystem root.
+    This prevents accidental mass-deletion when housekeeping is run with bad paths.
     """
     if not path.exists():
         return
+
+    # Safety guards: never remove the repository/home/root directories
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as e:
+        # If resolution fails for expected OS/runtime issues, refuse to remove the path
+        Colors.print(f"Refusing to remove path (unable to resolve): {path} ({e})", Colors.FAIL)
+        return
+
+    dangerous_targets = {ANVIL_ROOT.resolve(), HOME.resolve(), Path('/').resolve()}
+    if resolved in dangerous_targets:
+        Colors.print(f"Refusing to remove critical path: {path}", Colors.FAIL)
+        return
+
     attempt = 0
     last_err: Optional[OSError] = None
     while attempt < retries:
@@ -1025,20 +1042,36 @@ class Anvil:
         if str(BIN_DIR) not in os.environ["PATH"]:
             Colors.print(f"WARNING: Add {BIN_DIR} to your PATH.", Colors.WARNING)
 
-    def housekeeping(self):
-        """
-        Cleans up build directories, orphaned binaries, and unused dependencies.
+    def housekeeping(self) -> None:
+        """Cleans up build directory contents, orphaned binaries, and unused dependencies.
+
+        Safety: do NOT remove the Anvil root directory itself; only clear the
+        contents of the build directory so accidental deletion of ~/.anvil is prevented.
         """
         Colors.print("Running housekeeping...", Colors.HEADER)
-        # Remove build directory
+
+        # Clear contents of the build directory but keep the BUILD_DIR itself intact
         if BUILD_DIR.exists():
-            safe_rmtree(BUILD_DIR)
+            for child in BUILD_DIR.iterdir():
+                try:
+                    if child.is_dir():
+                        safe_rmtree(child)
+                    else:
+                        # remove files directly
+                        child.unlink()
+                except (OSError, ValueError) as e:
+                    Colors.print(f"Failed to remove build entry {child}: {e}", Colors.WARNING)
             Colors.print("Build directory cleaned.", Colors.OKGREEN)
-        # Remove orphaned binaries (not in installed packages)
+
+        # Remove orphaned binaries (only remove files that point to known install prefixes)
         installed = {p.name for p in INSTALL_DIR.iterdir() if p.is_dir()}
-        for bin_file in BIN_DIR.iterdir():
-            if bin_file.is_file():
+        if BIN_DIR.exists():
+            for bin_file in BIN_DIR.iterdir():
+                if not bin_file.is_file():
+                    continue
+                # On Windows we have shims like <name>.bat -> installed files; check stem
                 name = bin_file.stem
+                # Only remove the shim if it does NOT correspond to any installed package
                 if name not in installed:
                     try:
                         bin_file.unlink()
