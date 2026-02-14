@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import anvil
 from anvil import Anvil
 
 
@@ -77,7 +78,8 @@ class TestForgeAutoSubmitFlow(unittest.TestCase):
             a.index.db_path = tmp_db
             a.index.ensure_db()
             # Forge local path
-            a.forge(str(self.repo_dir))
+            with unittest.mock.patch('anvil.check_for_release', return_value=False):
+                a.forge(str(self.repo_dir))
             self.assertTrue(a.index.has_url('https://github.com/testuser/autosubmit-test'))
         finally:
             if orig is None:
@@ -96,7 +98,8 @@ class TestForgeAutoSubmitFlow(unittest.TestCase):
                 tmp_db.unlink()
             a.index.db_path = tmp_db
             a.index.ensure_db()
-            a.forge(str(self.repo_dir))
+            with unittest.mock.patch('anvil.check_for_release', return_value=False):
+                a.forge(str(self.repo_dir))
             self.assertFalse(a.index.has_url('https://github.com/testuser/autosubmit-test'))
         finally:
             if orig is None:

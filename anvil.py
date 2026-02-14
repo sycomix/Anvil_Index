@@ -10,12 +10,14 @@ import argparse
 import platform
 import urllib.request
 import urllib.parse
+import urllib.error
 # tarfile and zipfile removed; using shell tools in AutoBuilder
 import sqlite3
 from pathlib import Path
 import stat
 import time
 import logging
+from typing import Optional, List, Dict, Tuple, Union, Callable, Any, Set
 # Setup logger for Anvil; level can be overridden via ANVIL_LOG_LEVEL
 log_level = os.environ.get('ANVIL_LOG_LEVEL', 'INFO').upper()
 numeric_level = getattr(logging, log_level, logging.INFO)
@@ -66,11 +68,11 @@ class Colors:
             print(f"{color}{prefix} {msg}{Colors.ENDC}")
 
 # --- Utilities ---
-def run_cmd(command, cwd=None, shell=True, verbose=True, env=None):
-    """Run a shell command and return on success.
+def run_cmd(command: str, cwd: Optional[str] = None, shell: bool = True, verbose: bool = True, env: Optional[Dict[str, str]] = None) -> str:
+    """Run a shell command and return its stdout on success.
 
-    If the command fails, prints an error and exits unless the command is
-    a git command, in which case the original exception is re-raised.
+    On failure, raises CommandExecutionError for command-specific failures or
+    exits the process for non-git related OS/subprocess errors (legacy behavior).
     """
     try:
         # Use run to capture output for diagnostics (esp. linker errors)
@@ -85,13 +87,13 @@ def run_cmd(command, cwd=None, shell=True, verbose=True, env=None):
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as e:
         # Generic fallback for known exception types (avoid catching BaseException/Exception)
         Colors.print(f"Command failed: {command} ({e})", Colors.FAIL)
-        if "git" in str(command):
-            # Re-raise errors for git commands so callers can handle them
+        # Preserve original behavior for git commands (caller expects an exception)
+        if isinstance(command, str) and "git" in command:
             raise
         # Keep previous behavior: exit on failure for non-git commands
         sys.exit(1)
 
-def run_cmd_output(command, cwd=None, shell=True, env=None):
+def run_cmd_output(command: str, cwd: Optional[str] = None, shell: bool = True, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Run a command and return its stdout or None if the command fails.
 
     This function is a convenience wrapper around subprocess.check_output,
@@ -117,7 +119,7 @@ class CommandExecutionError(Exception):
         self.stderr = stderr
 
 
-def detect_lnk_and_pic_issues(stderr: str) -> list:
+def detect_lnk_and_pic_issues(stderr: str) -> List[str]:
     """Scan output for LNK2038 (RuntimeLibrary mismatch) or PIC errors and return suggestions.
 
     Returns a list of suggestion strings to apply in order to fix the issue.
@@ -153,14 +155,14 @@ def detect_lnk_and_pic_issues(stderr: str) -> list:
     return suggestions
 
 
-def default_build_env(msvc_runtime_override=None, force_pic_override=None):
+def default_build_env(msvc_runtime_override: Optional[str] = None, force_pic_override: Optional[bool] = None) -> Dict[str, str]:
     """Return a default environment dictionary for build commands.
 
     On Windows with MSVC we force the compiler runtime to use the dynamic CRT
     (i.e. /MD / MultiThreadedDLL) to avoid linker mismatches across multi-stage
     builds that include both rust/cargo cmake and C/C++ build steps.
     """
-    env = os.environ.copy()
+    env: Dict[str, str] = os.environ.copy()
     if os.name == 'nt':
         # Ensure we request the dynamic CRT. Prefer /MD over /MT.
         # Allow overriding via ANVIL_MSVC_RUNTIME: 'MD' (dll) or 'MT' (static)
@@ -206,7 +208,135 @@ def default_build_env(msvc_runtime_override=None, force_pic_override=None):
     return env
 
 
-def _on_rm_error(func, path, exc_info):
+# --- GitHub release check helpers ---
+def _platform_asset_tokens() -> Set[str]:
+    """Return tokens to match against release asset filenames for this platform."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    tokens: Set[str] = {system, machine, "x86_64", "x64", "amd64"}
+    if system == 'windows':
+        tokens.update({'win', 'windows', '.exe', 'zip'})
+    elif system == 'darwin' or 'mac' in system or 'darwin' in system:
+        tokens.update({'mac', 'darwin', 'dylib', 'tar.gz', 'zip'})
+    else:
+        tokens.update({'linux', 'tar.gz', 'tar.xz', 'tgz'})
+    return tokens
+
+
+def _asset_name_matches_platform(asset_name: str) -> bool:
+    """Return True if the asset name looks like a prebuilt for this platform."""
+    if not asset_name:
+        return False
+    name = asset_name.lower()
+    tokens = _platform_asset_tokens()
+    return any(tok in name for tok in tokens)
+
+
+def _normalize_github_owner_repo(target: str) -> Optional[str]:
+    """Try to extract 'owner/repo' from a URL or 'owner/repo' string."""
+    if not target:
+        return None
+    # already in owner/repo form
+    if '/' in target and target.count('/') == 1 and not target.startswith('http'):
+        return target
+    # https://github.com/owner/repo(.git)?
+    m = re.search(r'github\\.com[:/]+([^/]+)/([^/\\.]+)', target)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return None
+
+
+def check_for_release(target: str) -> bool:
+    """Check GitHub releases for a platform-matching prebuilt for `target`.
+
+    If a matching prebuilt asset is already installed under the local
+    install prefix (`~/.anvil/opt/<name>`) this returns True.  If a remote
+    platform-matching release asset is found the function will attempt to
+    download and extract it into the install prefix and then return True.
+    On any error or if no suitable release is found, returns False.
+
+    This helper is conservative: it never raises on network errors and is
+    safe to call from unit tests (tests should patch it when offline).
+    """
+    # (type hints maintained for callers)    # Derive a package name from the target (URL, owner/repo, or local name)
+    name = None
+    owner_repo = _normalize_github_owner_repo(target) if isinstance(target, str) else None
+    if owner_repo:
+        name = owner_repo.split('/')[-1]
+    else:
+        # If target is a local path like ./foo or absolute, use basename
+        name = os.path.basename(str(target)).replace('.git', '')
+
+    install_path = INSTALL_DIR / name
+    # If already installed locally, skip build
+    if install_path.exists() and any(install_path.iterdir()):
+        Colors.print(f"Found existing installation for {name}; skipping release check.", Colors.OKGREEN)
+        return True
+
+    # If we cannot determine a GitHub owner/repo, bail out
+    if not owner_repo:
+        return False
+
+    api_url = f"https://api.github.com/repos/{owner_repo}/releases/latest"
+    try:
+        headers = {'User-Agent': 'anvil-release-check/1.0'}
+        token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+        if token:
+            headers['Authorization'] = f"token {token}"
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = getattr(resp, 'status', None) or resp.getcode()
+            if status != 200:
+                logger.warning("GitHub API returned status %s for %s", status, api_url)
+                return False
+            data = json.load(resp)
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+        logger.warning("Release check network/parsing error for %s: %s", api_url, e)
+        return False
+
+    assets = data.get('assets', []) or []
+    for asset in assets:
+        asset_name = asset.get('name') or ''
+        if _asset_name_matches_platform(asset_name):
+            download_url = asset.get('browser_download_url')
+            if not download_url:
+                continue
+            # Attempt to download and extract/install into install_path
+            try:
+                tmp_dir = Path(os.getenv('TMP', '/tmp'))
+                tmp_file = tmp_dir / asset_name
+                Colors.print(f"Downloading prebuilt release asset: {asset_name}", Colors.OKBLUE)
+                urllib.request.urlretrieve(download_url, str(tmp_file))
+                install_path.mkdir(parents=True, exist_ok=True)
+                # Try to unpack common archive formats; fall back to saving a single binary in bin/
+                try:
+                    shutil.unpack_archive(str(tmp_file), str(install_path))
+                except (shutil.ReadError, ValueError):
+                    # Not an archive — copy to bin
+                    bin_dir = install_path / 'bin'
+                    bin_dir.mkdir(parents=True, exist_ok=True)
+                    dest = bin_dir / asset_name
+                    shutil.copy2(str(tmp_file), str(dest))
+                    if os.name != 'nt':
+                        dest.chmod(dest.stat().st_mode | stat.S_IXUSR)
+                finally:
+                    # Best-effort cleanup of temporary file
+                    try:
+                        if tmp_file.exists():
+                            tmp_file.unlink()
+                    except OSError as e:
+                        logger.warning("Failed to remove temp file %s: %s", tmp_file, e)
+                Colors.print(f"Installed prebuilt release for {name}", Colors.OKGREEN)
+                return True
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError, shutil.ReadError, ValueError) as e:
+                logger.warning("Failed to download/install release asset %s: %s", asset_name, e)
+                # treat as no suitable release available
+                return False
+
+    return False
+
+
+def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:
     """Error handler for shutil.rmtree to handle read-only files on Windows.
     Tries to make file writable and retries the operation.
     """
@@ -222,14 +352,14 @@ def _on_rm_error(func, path, exc_info):
         raise exc_info[1]
 
 
-def safe_rmtree(path, retries: int = 3, delay: float = 0.5):
+def safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
     """Remove directory tree safely, dealing with Windows read-only attributes.
     Retries removal a few times with small delays in case files are transiently locked.
     """
     if not path.exists():
         return
     attempt = 0
-    last_err = None
+    last_err: Optional[OSError] = None
     while attempt < retries:
         try:
             shutil.rmtree(path, onerror=_on_rm_error)
@@ -249,16 +379,15 @@ class AutoBuilder:
     without requiring a formula file.
     """
     @staticmethod
-    def _get_parallel_jobs():
+    def _get_parallel_jobs() -> str:
         """Return the number of parallel jobs to use for builds (e.g. -j4)."""
-        try:
-            count = os.cpu_count() or 1
-            return str(count)
-        except Exception:
+        count = os.cpu_count()
+        if not count or count < 1:
             return "1"
+        return str(count)
 
     @staticmethod
-    def detect(source_path, install_prefix):
+    def detect(source_path: Path, install_prefix: Path) -> Tuple[List[Union[str, Callable[[Path, Path], None]]], List[str], Dict[str, Any]]:
         steps = []
         metadata = {}
         # 1. Check for explicit 'anvil.json' in the repo (The "Gold Standard")
@@ -784,14 +913,14 @@ class RepoIndex:
         """
         self._ensure_exists()
 
-    def get_url(self, name):
+    def get_url(self, name: str) -> Optional[str]:
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
             c.execute("SELECT url FROM repositories WHERE name=?", (name,))
             result = c.fetchone()
             return result[0] if result else None
 
-    def has_url(self, url):
+    def has_url(self, url: str) -> bool:
         """Return True if the given URL is already present in the index DB."""
         if not url:
             return False
@@ -807,7 +936,7 @@ class RepoIndex:
                     return True
             return False
 
-    def add_local(self, name, url):
+    def add_local(self, name: str, url: str) -> None:
         # Normalize url before adding to avoid duplicates across formats
         if not url:
             raise ValueError("URL cannot be empty when adding to index")
@@ -820,7 +949,7 @@ class RepoIndex:
             conn.commit()
 
     @staticmethod
-    def normalize_url(url: str) -> str:
+    def normalize_url(url: Optional[str]) -> Optional[str]:
         """Return a canonical normalized URL for easier comparison.
 
         Normalizes forms like git@host:user/repo.git -> https://host/user/repo, strips
@@ -918,12 +1047,15 @@ class Anvil:
                         Colors.print(f"Failed to remove binary: {bin_file.name} ({e})", Colors.WARNING)
         Colors.print("Housekeeping complete.", Colors.OKGREEN)
 
-    def forge(self, target, msvc_runtime=None, force_pic=None):
+    def forge(self, target: str, msvc_runtime: Optional[str] = None, force_pic: Optional[bool] = None, check_release: bool = True) -> None:
         """
         Target can be:
         1. A package name in the index (e.g., 'htop')
         2. A git URL (e.g., 'https://github.com/foo/bar')
         3. A local path (e.g., './my-project')
+
+        check_release: consult `check_for_release` to detect and install a
+        platform-matching prebuilt release before attempting to clone/build.
         """
 
         url = None
@@ -965,6 +1097,13 @@ class Anvil:
             Colors.print(f"Index Forge: {name} from {url}", Colors.HEADER)
 
         # Prepare Paths
+        # If requested, consult GitHub releases / local install before building
+        if check_release:
+            release_target = url or name
+            if check_for_release(release_target):
+                Colors.print(f"Platform-matching release found for {name}; skipping build.", Colors.OKGREEN)
+                return
+
         build_path = BUILD_DIR / name
         install_path = INSTALL_DIR / name
 
@@ -1204,6 +1343,7 @@ def main():
     forge_parser.add_argument("target")
     forge_parser.add_argument("--msvc-runtime", choices=['MD', 'MT'], help="Override MSVC runtime used for builds (MD or MT)")
     forge_parser.add_argument("--force-pic", action='store_true', help="Force -fPIC on POSIX builds (overrides env/meta)")
+    forge_parser.add_argument("--no-release-check", action='store_true', help="Disable GitHub release check; force build from source")
 
     # SUBMIT: Add to index
     subparsers.add_parser("submit", help="Add URL to index").add_argument("url")
@@ -1223,7 +1363,7 @@ def main():
     anvil = Anvil()
 
     if args.command == "forge":
-        anvil.forge(args.target, msvc_runtime=args.msvc_runtime, force_pic=args.force_pic)
+        anvil.forge(args.target, msvc_runtime=args.msvc_runtime, force_pic=args.force_pic, check_release=not getattr(args, 'no_release_check', False))
     elif args.command == "submit":
         anvil.submit(args.url)
     elif args.command == "search":

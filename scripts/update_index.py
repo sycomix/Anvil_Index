@@ -60,7 +60,7 @@ def process_submissions():
             
         except json.JSONDecodeError:
             print(f"Error decoding {file_path.name}. Skipping.")
-        except Exception as e:
+        except (OSError, sqlite3.Error, ValueError, TypeError) as e:
             print(f"Unexpected error on {file_path.name}: {e}")
 
     conn.commit()
