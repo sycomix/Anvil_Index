@@ -53,6 +53,37 @@ class TestRepoIndexRepair(unittest.TestCase):
             idx.update()
             rc.assert_any_call(f"git clone {INDEX_REPO_URL} .", cwd=anvil.INDEX_DIR, verbose=False)
 
+    def test_repair_handles_files_inside_index_dir(self):
+        # index directory may contain stray files (e.g. corrupted index.db); repair should still attempt reclone
+        (anvil.INDEX_DIR / 'index.db').write_text('corrupt')
+        (anvil.INDEX_DIR / 'junk').write_text('x')
+        (anvil.INDEX_DIR / 'subdir').mkdir()
+        (anvil.INDEX_DIR / 'subdir' / 'f').write_text('y')
+
+        with mock.patch('anvil.run_cmd', return_value='cloned') as rc:
+            idx = RepoIndex()
+            # should not raise and should attempt to reclone
+            idx.repair()
+            rc.assert_any_call(f"git clone {INDEX_REPO_URL} .", cwd=anvil.INDEX_DIR, verbose=False)
+
+    def test_safe_rmtree_removes_files(self):
+        f = anvil.INDEX_DIR / 'tempfile.txt'
+        f.write_text('hello')
+        # ensure file exists then remove
+        self.assertTrue(f.exists())
+        anvil.safe_rmtree(f)
+        self.assertFalse(f.exists())
+
+    def test_check_reports_missing_git_and_stray_files(self):
+        # create stray file(s) and ensure .git missing
+        (anvil.INDEX_DIR / 'index.db').write_text('corrupt')
+        idx = anvil.RepoIndex()
+        ok, issues = idx.check()
+        self.assertFalse(ok)
+        # Expect at least a message about missing .git and unexpected top-level entries
+        self.assertTrue(any('.git' in s or 'Unexpected top-level entries' in s or 'Unexpected top-level' in s for s in issues))
+
+
 
 if __name__ == '__main__':
     unittest.main()

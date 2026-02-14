@@ -37,6 +37,8 @@ echo python "%CORE_DIR%\anvil.py" %%*
 
 :: 5. Initialize
 echo [ANVIL] Initializing environment...
+:: Attempt an index repair first to auto-clean corrupted files (safe/no-op if not needed)
+python "%CORE_DIR%\anvil.py" index repair || echo [ANVIL] index repair (pre-init) returned non-zero
 call "%BIN_DIR%\anvil.bat" update
 
 :: 6. Add to PATH

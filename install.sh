@@ -55,6 +55,8 @@ chmod +x "$BIN_DIR/anvil"
 
 # 5. Initialize (Create default taps/index)
 echo -e "${BLUE}Initializing Anvil...${NC}"
+# Attempt an index repair first to auto-clean corrupted files (safe/no-op if not needed)
+python3 "$CORE_DIR/anvil.py" index repair || true
 "$BIN_DIR/anvil" update
 
 # 6. Path Configuration

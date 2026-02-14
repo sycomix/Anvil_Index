@@ -353,8 +353,10 @@ def _on_rm_error(func: Callable[[str], None], path: str, exc_info: Any) -> None:
 
 
 def safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
-    """Remove directory tree safely, dealing with Windows read-only attributes.
-    Retries removal a few times with small delays in case files are transiently locked.
+    """Remove files or directory trees safely, dealing with Windows read-only attributes.
+
+    - If `path` is a file or symlink, unlink it (with retries).
+    - If `path` is a directory, call shutil.rmtree with an onerror handler.
 
     SAFETY: refuse to remove the Anvil root, the user's HOME, or the filesystem root.
     This prevents accidental mass-deletion when housekeeping is run with bad paths.
@@ -375,6 +377,26 @@ def safe_rmtree(path: Path, retries: int = 3, delay: float = 0.5) -> None:
         Colors.print(f"Refusing to remove critical path: {path}", Colors.FAIL)
         return
 
+    # If it's a file or a symlink, remove via unlink (handle permissions and retries)
+    if resolved.is_file() or path.is_symlink():
+        attempt = 0
+        last_err: Optional[OSError] = None
+        while attempt < retries:
+            try:
+                # Make writable if necessary (Windows read-only files)
+                if not os.access(path, os.W_OK):
+                    os.chmod(path, stat.S_IWRITE)
+                path.unlink()
+                return
+            except OSError as e:
+                last_err = e
+                Colors.print(f"Retrying removal of {path}: {e}", Colors.WARNING)
+                time.sleep(delay)
+                attempt += 1
+        Colors.print(f"Could not remove path {path} after {retries} attempts: {last_err}", Colors.FAIL)
+        return
+
+    # Otherwise treat as directory tree
     attempt = 0
     last_err: Optional[OSError] = None
     while attempt < retries:
@@ -1029,6 +1051,37 @@ class RepoIndex:
             logger.warning("Index repair failed: %s", getattr(e, 'stderr', str(e)))
             Colors.print("Index repair failed. You can manually remove ~/.anvil/index and run `anvil update`.", Colors.WARNING)
 
+    def check(self) -> Tuple[bool, List[str]]:
+        """Return (ok, issues) describing the local index health.
+
+        - ok == True when the index appears to be a valid git worktree with no
+          obvious top-level corruption.
+        - issues is a list of human-readable diagnostic strings.
+        """
+        issues: List[str] = []
+        if not INDEX_DIR.exists():
+            issues.append(f"Index directory missing: {INDEX_DIR}")
+            return False, issues
+
+        git_dir = INDEX_DIR / '.git'
+        if not git_dir.exists():
+            issues.append(".git directory missing — index not cloned")
+        else:
+            try:
+                out = run_cmd("git rev-parse --is-inside-work-tree", cwd=INDEX_DIR, verbose=False)
+                if str(out).strip().lower() != 'true':
+                    issues.append("Git reports this is not a work tree")
+            except (CommandExecutionError, subprocess.CalledProcessError, OSError) as e:
+                issues.append(f"git rev-parse failed: {getattr(e, 'stderr', str(e))}")
+
+        # Report unexpected top-level files which often indicate corruption
+        top_entries = [p.name for p in INDEX_DIR.iterdir() if p.name != '.git']
+        if top_entries:
+            issues.append(f"Unexpected top-level entries in index: {', '.join(top_entries)}")
+
+        ok = len(issues) == 0
+        return ok, issues
+
     def update(self):
         """Ensure the local index is synced with the central index.
 
@@ -1432,6 +1485,12 @@ def main():
     subparsers.add_parser("update", help="Update index")
     subparsers.add_parser("list", help="List installed")
 
+    # Index maintenance (repair/check)
+    index_parser = subparsers.add_parser("index", help="Index maintenance commands")
+    index_sub = index_parser.add_subparsers(dest="index_cmd")
+    index_sub.add_parser("repair", help="Repair local index (reclone)")
+    index_sub.add_parser("check", help="Check local index health and report issues")
+
     subparsers.add_parser("housekeeping", help="Clean up builds and binaries")
 
     args = parser.parse_args()
@@ -1447,6 +1506,19 @@ def main():
         anvil.uninstall(args.name)
     elif args.command == "update":
         anvil.index.update()
+    elif args.command == "index":
+        if getattr(args, 'index_cmd', None) == 'repair':
+            anvil.index.repair()
+        elif getattr(args, 'index_cmd', None) == 'check':
+            ok, issues = anvil.index.check()
+            if ok:
+                Colors.print("Local index looks healthy.", Colors.OKGREEN)
+            else:
+                Colors.print("Local index has issues:", Colors.WARNING)
+                for i in issues:
+                    Colors.print(f" - {i}", Colors.WARNING)
+        else:
+            parser.print_help()
     elif args.command == "list":
         for p in INSTALL_DIR.iterdir():
             print(p.name)
