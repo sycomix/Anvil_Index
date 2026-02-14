@@ -1018,8 +1018,9 @@ class RepoIndex:
             Colors.print("Syncing Central Index...", Colors.HEADER)
             try:
                 run_cmd("git pull", cwd=INDEX_DIR, verbose=False)
-            except (subprocess.CalledProcessError, OSError):
-                # If pull fails, ignore and continue
+            except (subprocess.CalledProcessError, OSError, CommandExecutionError) as e:
+                # If pull fails for any reason (including non-zero exit via run_cmd), log and continue
+                logger.warning("Central index sync failed: %s", getattr(e, 'stderr', str(e)))
                 pass
 
 # --- Main App ---
