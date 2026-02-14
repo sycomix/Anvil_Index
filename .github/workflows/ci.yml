@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ '**' ]
+
+jobs:
+  checks:
+    name: Static checks & ai-rules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run mypy
+        run: mypy
+
+      - name: Run ai-rules compliance test
+        run: python -m unittest tests.test_ai_rules_compliance.TestAiRulesCompliance.test_no_banned_patterns_in_production

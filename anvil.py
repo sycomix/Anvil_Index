@@ -1013,15 +1013,56 @@ class RepoIndex:
             c.execute("SELECT name, description, url FROM repositories WHERE name LIKE ? OR description LIKE ?", (pattern, pattern))
             return c.fetchall()
 
+    def repair(self) -> None:
+        """Attempt to repair the local index by removing contents and recloning.
+
+        This is an explicit repair action that callers (or the CLI) can invoke.
+        It logs user-facing messages and treats failures as non-fatal.
+        """
+        Colors.print("Repairing local index (reclone)...", Colors.HEADER)
+        try:
+            for p in INDEX_DIR.iterdir():
+                safe_rmtree(p)
+            run_cmd(f"git clone {INDEX_REPO_URL} .", cwd=INDEX_DIR, verbose=False)
+            Colors.print("Local index repaired (recloned).", Colors.OKGREEN)
+        except (OSError, CommandExecutionError) as e:
+            logger.warning("Index repair failed: %s", getattr(e, 'stderr', str(e)))
+            Colors.print("Index repair failed. You can manually remove ~/.anvil/index and run `anvil update`.", Colors.WARNING)
+
     def update(self):
-        if (INDEX_DIR / ".git").exists():
-            Colors.print("Syncing Central Index...", Colors.HEADER)
+        """Ensure the local index is synced with the central index.
+
+        If the index folder is missing a valid .git repository we attempt an
+        automatic recovery by calling repair(). Failures are logged but do not
+        raise to callers (installer must continue even when offline or when
+        index is corrupted).
+        """
+        Colors.print("Syncing Central Index...", Colors.HEADER)
+
+        git_dir = INDEX_DIR / ".git"
+        if git_dir.exists():
+            # Verify the index dir is a valid git working tree
+            try:
+                out = run_cmd("git rev-parse --is-inside-work-tree", cwd=INDEX_DIR, verbose=False)
+                if str(out).strip().lower() != 'true':
+                    raise CommandExecutionError('git rev-parse', 1, out, 'not a work tree')
+            except (CommandExecutionError, subprocess.CalledProcessError, OSError) as e:
+                logger.warning("Local index appears invalid: %s — attempting repair", getattr(e, 'stderr', str(e)))
+                Colors.print("Local index appears corrupted — Anvil will attempt automatic repair (reclone). If this persists, remove your index directory and re-run `anvil update`.", Colors.WARNING)
+                self.repair()
+                return
+
+            # If valid, perform a pull
             try:
                 run_cmd("git pull", cwd=INDEX_DIR, verbose=False)
-            except (subprocess.CalledProcessError, OSError, CommandExecutionError) as e:
-                # If pull fails for any reason (including non-zero exit via run_cmd), log and continue
+            except (CommandExecutionError, subprocess.CalledProcessError, OSError) as e:
                 logger.warning("Central index sync failed: %s", getattr(e, 'stderr', str(e)))
-                pass
+                Colors.print("Could not sync central index (network/auth error). This is non-fatal — you can retry later with `anvil update`.", Colors.WARNING)
+                return
+
+        else:
+            # No .git present — try repair (clone)
+            self.repair()
 
 # --- Main App ---
 
