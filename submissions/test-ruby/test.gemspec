@@ -1,1 +1,0 @@
-Gem::Specification.new 'test'
